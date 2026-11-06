@@ -357,6 +357,15 @@ static void obs_sdk_initialize(Cpu *c) { observe(c, "nninitInitializeSdkModule")
 static void obs_startup(Cpu *c) { observe(c, "nninitStartup"); }
 static void obs_main(Cpu *c) { observe(c, "nnMain"); }
 
+// void longjmp(jmp_buf, int): the guest sdk restores the saved registers and sp and branches to the setjmp call's
+// return address. main calls setjmp through a function pointer (main+0x60be8), which the generator cannot see as a
+// setjmp call site, so the resumed code would not know it has to dispatch on its returns; mark the chain here. The
+// guest longjmp never returns to this observer.
+static void obs_longjmp(Cpu *c) {
+    rt_original_resumed(c);
+    rt_fatal("longjmp returned to its caller");
+}
+
 // Result os::AllocateAddressRegion(uintptr_t *out, size_t size)
 static void obs_address_region(Cpu *c) {
     uint64_t *out = arg_p(c, 0), size = arg_x(c, 1);
@@ -922,6 +931,8 @@ HOST_OBSERVER("nnosInitialize", obs_os_initialize);
 HOST_OBSERVER("nninitInitializeSdkModule", obs_sdk_initialize);
 HOST_OBSERVER("nninitStartup", obs_startup);
 HOST_OBSERVER("nnMain", obs_main);
+HOST_OBSERVER("longjmp", obs_longjmp);
+HOST_OBSERVER("_longjmp", obs_longjmp);
 
 HOST_OVERRIDE("_ZN2nn7account10InitializeEv", ov_account_initialize);
 HOST_OVERRIDE("_ZN2nn7account22TryOpenPreselectedUserEPNS0_10UserHandleE", ov_open_user);

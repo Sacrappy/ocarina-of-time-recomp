@@ -233,3 +233,26 @@ uint64_t rt_original(Cpu *c) {
     c->resumed = resumed;
     return c->x[0];
 }
+
+// The same for a guest definition that never returns into the observer: its indirect branch into the setjmp call's
+// return address starts a longjmp resume chain, so the guest runs with the resumed mark set (main calls setjmp
+// through a function pointer, which the generator cannot recognise as a setjmp call site).
+uint64_t rt_original_resumed(Cpu *c) {
+    uint64_t i = (c->pc - RT_HOSTFN_BASE) >> 4;
+    if ((c->pc & 15) || i >= (uint64_t)nslots || !slots[i].original)
+        rt_fatal("rt_original_resumed at %#llx: not inside an observer with a guest definition", (unsigned long long)c->pc);
+    uint64_t lr = c->x[30], pc = c->pc;
+    uint8_t resumed = c->resumed;
+    c->x[30] = RT_RET_HOST;
+    c->pc = slots[i].original;
+    c->resumed = 1;
+    int *d = c->thread ? kern_host_depth(c->thread) : NULL;
+    int depth = d ? *d : 0;
+    if (d) __atomic_store_n(d, depth - 1, __ATOMIC_RELAXED);
+    rt_dispatch(c);
+    if (d) __atomic_store_n(d, depth, __ATOMIC_RELAXED);
+    c->x[30] = lr;
+    c->pc = pc;
+    c->resumed = resumed;
+    return c->x[0];
+}

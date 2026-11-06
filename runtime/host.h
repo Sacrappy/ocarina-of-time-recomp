@@ -115,6 +115,8 @@ const char *hostfn_table_name(int observers, int i);       // symbol of linked e
 uint64_t rt_original(Cpu *c);                              // inside an observer: call the guest definition with the
                                                            // current x0..x7, return x0. Uses c->pc, so call it before
                                                            // anything that changes c->pc (rt_call restores it)
+uint64_t rt_original_resumed(Cpu *c);                      // the same, for a guest definition that longjmps out (it
+                                                           // marks the resume chain: see Cpu.resumed)
 uint64_t rt_call(Cpu *c, uint64_t fn, int n, ...);         // host -> guest, section 2.3. n <= 8 arguments, each read
                                                            // as uint64_t: cast every argument. Seals the dispatch
                                                            // table on first use. Sets x30 = RT_RET_HOST, restores
