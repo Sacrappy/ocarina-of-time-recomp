@@ -293,34 +293,6 @@ static int create_device(void) {
     if (!c->fault.deviceFault) g_vk.has_device_fault = 0;   // vkGetDeviceFaultInfoEXT needs the feature, not just the extension
     g_vk.has_buffer_device_address = c->f12.bufferDeviceAddress;
     g_vk.has_astc_ldr = h->textureCompressionASTC_LDR;
-    // Descriptor indexing (docs/bindless.md): the bindless pool arrays are descriptor arrays of the pool's size indexed
-    // with a value the shader computes, written once and updated in place while the GPU may read them. Every flag below
-    // is part of the same chain and is enabled above when the driver reports it. OOT_POOL_ARRAYS=0 keeps it off, so a
-    // run can tell what the arrays changed: their draws are then skipped with a log instead of sampling the pool.
-    g_vk.has_pool_arrays = cfg_bool("OOT_POOL_ARRAYS") && c->f12.descriptorIndexing &&
-                           c->f12.shaderSampledImageArrayNonUniformIndexing &&
-                           c->f12.descriptorBindingSampledImageUpdateAfterBind && c->f12.descriptorBindingPartiallyBound;
-    {
-        VkPhysicalDeviceVulkan12Properties p12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
-        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &p12};
-        vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
-        // The pool set declares GFX_POOL_KINDS arrays of GFX_POOL_TEX_SLOTS sampled images plus one sampler array; both
-        // limits count every sampled image of a stage, so a device below that cannot take the arrays.
-        uint32_t need = (uint32_t)(GFX_POOL_KINDS - 1) * GFX_POOL_TEX_SLOTS;
-        if (g_vk.has_pool_arrays && (p12.maxPerStageDescriptorUpdateAfterBindSampledImages < need ||
-                                     p12.maxDescriptorSetUpdateAfterBindSampledImages < need ||
-                                     p12.maxPerStageDescriptorUpdateAfterBindSamplers < GFX_POOL_SAMP_SLOTS))
-            g_vk.has_pool_arrays = 0;
-        rt_log("vk: descriptor indexing: %d (descriptorIndexing %d, non-uniform sampled arrays %d, update-after-bind "
-               "sampled images and samplers %d, partially bound %d; %u sampled images needed per stage of %u per stage / "
-               "%u per set; %u samplers of %u)", g_vk.has_pool_arrays, c->f12.descriptorIndexing,
-               c->f12.shaderSampledImageArrayNonUniformIndexing, c->f12.descriptorBindingSampledImageUpdateAfterBind,
-               c->f12.descriptorBindingPartiallyBound, need,
-               p12.maxPerStageDescriptorUpdateAfterBindSampledImages, p12.maxDescriptorSetUpdateAfterBindSampledImages,
-               GFX_POOL_SAMP_SLOTS, p12.maxPerStageDescriptorUpdateAfterBindSamplers);
-        if (!g_vk.has_pool_arrays)
-            rt_log("vk: bindless pool arrays off: the level's materials that sample through a pool keep the placeholder");
-    }
     {
         const char *e = cfg_get("OOT_FEEDBACK");
         int layout_ok = has_fbl && has_lr && c->fbl.attachmentFeedbackLoopLayout && c->lr.dynamicRenderingLocalRead;

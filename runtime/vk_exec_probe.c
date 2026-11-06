@@ -668,7 +668,7 @@ static int test_c0(void) {
     const uint32_t dim[3] = {3, 2, 1};
     uint32_t u[4];
     uint64_t a;
-    vk_c0_fill(bank, 5, ssbo, ubo, dim, 7, NULL, 0);
+    vk_c0_fill(bank, 5, ssbo, ubo, dim, 7);
     memcpy(u, bank + 0x200, 12);
     CHECK(u[0] == 3 && u[1] == 2 && u[2] == 1, "c0 dispatch size is %u %u %u", u[0], u[1], u[2]);
     memcpy(&a, bank + 0x320, 8), memcpy(u, bank + 0x328, 4);
@@ -677,7 +677,7 @@ static int test_c0(void) {
     CHECK(a == 0x55660000 && u[0] == 0x100, "c0 0x250 (uniform slot 4) is {%#llx, %#x}", (unsigned long long)a, u[0]);
     for (int i = 0; i < 16; i++) CHECK(!bank[0x310 + i], "c0 0x310 (unbound storage slot 0) byte %d is %02x", i, bank[0x310 + i]);
     CHECK(!bank[0x644] && !bank[0x610], "c0 of a compute stage has graphics words");
-    vk_c0_fill(bank, 0, ssbo, ubo, dim, 61, NULL, 0);
+    vk_c0_fill(bank, 0, ssbo, ubo, dim, 61);
     float ps;
     memcpy(&ps, bank + 0x610, 4), memcpy(u, bank + 0x644, 4);
     CHECK(ps == 2047.0f && u[0] == 61, "vertex c0: point size %g at 0x610, base instance %u at 0x644", ps, u[0]);
