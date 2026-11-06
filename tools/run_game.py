@@ -40,8 +40,9 @@ MAX_RUNS = int(os.environ.get('OOT_MAX_RUNS', '3'))   # more parallel runs exhau
 
 
 def count(image):
-    out = subprocess.run(['tasklist', '/FI', f'IMAGENAME eq {image}', '/NH'], capture_output=True, text=True).stdout
-    return sum(line.lower().startswith(image) for line in out.splitlines())
+    # tasklist writes the OEM code page (French Windows included), not UTF-8; the image names themselves are ASCII.
+    out = subprocess.run(['tasklist', '/FI', f'IMAGENAME eq {image}', '/NH'], capture_output=True).stdout
+    return sum(line.lower().startswith(image) for line in out.decode('mbcs', errors='replace').splitlines())
 
 
 def busy():

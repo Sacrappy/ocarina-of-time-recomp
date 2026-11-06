@@ -911,7 +911,13 @@ static void perf_tick(uint64_t now, const MenuTarget *t) {
         g_perf_frames++;
         if (d > g_perf_max_ns) g_perf_max_ns = d;
         if (g_perf_win_ns >= 500000000ull) {
-            snprintf(g_perf_text, sizeof g_perf_text, menu_text(UI_PERF_LINE_FPS), g_perf_frames * 1e9 / g_perf_win_ns);
+            // One F10 shows both numbers asked for: the rate and the frame times it comes from (the average of the
+            // window and its worst frame).
+            char fps[32], ms[40], mx[40];
+            snprintf(fps, sizeof fps, menu_text(UI_PERF_LINE_FPS), g_perf_frames * 1e9 / g_perf_win_ns);
+            snprintf(ms, sizeof ms, menu_text(UI_MENU_OV_FRAME_MS), g_perf_win_ns / 1e6 / g_perf_frames);
+            snprintf(mx, sizeof mx, menu_text(UI_MENU_OV_MAX_MS), g_perf_max_ns / 1e6);
+            snprintf(g_perf_text, sizeof g_perf_text, "%s  %s  %s", fps, ms, mx);
             g_perf_win_ns = g_perf_max_ns = 0;
             g_perf_frames = 0;
         }

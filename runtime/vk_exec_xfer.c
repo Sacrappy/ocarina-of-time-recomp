@@ -477,6 +477,28 @@ static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
     vk_texture_gpu_written(p->dst);
 }
 
+// Whole-image linear blit, both images in VK_IMAGE_LAYOUT_GENERAL: vk_exec_draw.c's replacement for the game's neural
+// upscaler pass (OOT_GAME_UPSCALER=bilinear). The formats may differ; the driver converts while filtering, and an sRGB
+// destination stores the source's values unchanged (the network's final pass does the same through a storage view).
+int vk_exec_blit_linear(VkExec *ex, const VkTexImage *src, const VkTexImage *dst) {
+    if (!src || !dst || src->type != VK_IMAGE_TYPE_2D || dst->type != VK_IMAGE_TYPE_2D) return 0;
+    if (src->samples != 1 || dst->samples != 1 || !(src->aspect & VK_IMAGE_ASPECT_COLOR_BIT) ||
+        !(dst->aspect & VK_IMAGE_ASPECT_COLOR_BIT) || !src->width || !src->height || !dst->width || !dst->height)
+        return 0;
+    VkImageBlit bl = {0};
+    bl.srcSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    bl.dstSubresource = bl.srcSubresource;
+    bl.srcOffsets[0] = (VkOffset3D){0, 0, 0};
+    bl.srcOffsets[1] = (VkOffset3D){(int32_t)src->width, (int32_t)src->height, 1};
+    bl.dstOffsets[0] = (VkOffset3D){0, 0, 0};
+    bl.dstOffsets[1] = (VkOffset3D){(int32_t)dst->width, (int32_t)dst->height, 1};
+    vk_exec_pass_end(ex);
+    vk_exec_barrier(ex);   // the source's writes, and the destination's previous readers, are done
+    vkCmdBlitImage(ex->cb, src->image, VK_IMAGE_LAYOUT_GENERAL, dst->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
+    ex->recorded++;
+    return 1;
+}
+
 // ---- buffer to buffer
 
 static void copy_b2b(VkExec *ex, const p_copy_b2b *p) {

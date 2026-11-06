@@ -30,6 +30,7 @@ import json
 import multiprocessing as mp
 import os
 import re
+import struct
 import sys
 import time
 from collections import Counter
@@ -238,8 +239,37 @@ class Emitter:
         self.reg_locals = reg_locals   # recomp/regs.py: registers per function in C locals
         self.kept = regs.CALLEE_SAVED if callee_saved else frozenset()   # not reloaded after a call
         self.uses_patches = False
+        self.resumes = {}              # {resume pc: entry function} of the chunk being emitted (rt_dispatch)
         self.stats = Counter()
         self.unsupported = Counter()
+        self.plt = self._find_plt()    # guest addresses of PLT stubs: only a call there can be a setjmp (longjmp resumes)
+
+    def _find_plt(self):
+        """The setjmp stub of this module: only a setjmp call returns twice (longjmp resumes at its return address)."""
+        img, base, lo, hi = self.mod.image, self.mod.base, self.mod.lo, self.mod.hi
+        n = self.mod.nso
+        jmprel, pltsz = n.dyn.get(23, 0), n.dyn.get(2, 0)   # DT_JMPREL, DT_PLTRELSZ
+        imported = {}
+        for i in range(pltsz // 24):
+            off, info, _ = struct.unpack_from('<QQq', n.image, jmprel + i * 24)
+            if (info & 0xffffffff) != 1026:   # R_AARCH64_JUMP_SLOT
+                continue
+            sym = info >> 32
+            if sym < len(n.syms) and 'setjmp' in n.syms[sym][0]:
+                imported[off] = n.syms[sym][0]
+        out = set()
+        for a in range(lo, hi - 16, 4):
+            o = a - base
+            w0 = int.from_bytes(img[o:o + 4], 'little')
+            w1 = int.from_bytes(img[o + 4:o + 8], 'little')
+            w3 = int.from_bytes(img[o + 12:o + 16], 'little')
+            if (w0 & 0x9f00001f) != 0x90000010 or (w1 & 0xffc003ff) != 0xf9400211 or w3 != 0xd61f0220:
+                continue
+            imm = ((w0 >> 29) & 3) | (((w0 >> 5) & 0x7ffff) << 2)
+            slot = (a & ~0xfff) + (imm << 12) + (((w1 >> 10) & 0xfff) * 8) - base
+            if slot in imported:
+                out.add(a)
+        return out
 
     def scan(self, insns, entry, end):
         """Labels and jump tables of one function: {pc: sorted targets} for resolved tables, 'all' for an
@@ -347,6 +377,17 @@ class Emitter:
         all_labels = 'all' in tables.values()
         if all_labels:
             labels = set(range(entry, end, 4))
+        # Resume points: the instruction after a call to a PLT stub. A setjmp/longjmp returns to the setjmp call's
+        # return address from a different host stack, so rt_dispatch must be able to enter this function there (fr_
+        # below, or fb_ for all-label functions). Direct calls to known functions never need one: only setjmp returns
+        # twice. They become labels, so the switch can jump to them after the prologue.
+        resume = set()
+        for i, ins in enumerate(insns):
+            if ins.kind == 'bl' and ins.target in self.plt:
+                r = entry + 4 * i + 4
+                if entry <= r < end and r not in self.starts:
+                    resume.add(r)
+        labels |= resume
         # An unresolved computed br re-enters the function through fb_<entry>, a C function of its own, which local
         # flags would not survive; such functions keep NZCV in c->nzcv.
         # The same holds for registers in locals (recomp/regs.py): fb_<entry> keeps them in the Cpu too.
@@ -385,14 +426,23 @@ class Emitter:
             fb = f'fb_{entry:x}'
             cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in range(entry, end, 4))
             redispatch = f'{MUSTTAIL} {fb}(c);'
-            out = [f'static void {fb}(Cpu *c);',
+            out = [f'void {fb}(Cpu *c);',
                    f'void {fname(entry)}(Cpu *c) {{', f'    FN_ENTER({hx(entry)});', f'    c->pc = {hx(entry)};',
                    f'    {redispatch}', '}',
-                   f'static void {fb}(Cpu *c) {{', f'    switch (c->pc) {{ {cases} default: break; }}',
+                   f'void {fb}(Cpu *c) {{', f'    switch (c->pc) {{ {cases} default: break; }}',
                    f'    {MUSTTAIL} rt_dispatch(c);']
         else:
             redispatch = f'{MUSTTAIL} rt_dispatch(c);'
-            out = [f'void {fname(entry)}(Cpu *c) {{', f'    FN_ENTER({hx(entry)});']
+            if resume:
+                # The body moves into fr_<entry>, which switches on c->pc after the prologue; f_<entry> is the
+                # trampoline that enters at the function start. Both have the Cpu* signature the musttail branches in
+                # the body need. A longjmp restores the guest state and dispatch lands in fr_ at the call's return.
+                fr = f'fr_{entry:x}'
+                out = [f'void {fr}(Cpu *c);',
+                       f'void {fname(entry)}(Cpu *c) {{ c->pc = {hx(entry)}; {fr}(c); }}',
+                       f'void {fr}(Cpu *c) {{', f'    FN_ENTER({hx(entry)});']
+            else:
+                out = [f'void {fname(entry)}(Cpu *c) {{', f'    FN_ENTER({hx(entry)});']
             if fp.used:
                 out.append('    ' + fp.decl())
 
@@ -482,6 +532,9 @@ class Emitter:
             rp = regs.plan(texts, succ, clean, self.reg_locals, self.kept)
             if rp.regs:
                 out.append('    ' + rp.decl())
+            if resume:
+                cases = ' '.join(f'case {hx(pc)}: goto L_{pc:x};' for pc in sorted(resume))
+                out.append(f'    switch (c->pc) {{ {cases} default: break; }}')
             self.stats['local_reg_functions'] += bool(rp.regs)
             self.stats['reg_spills'] += sum(len(s) for s in rp.spill)
             out += [line if i is None else rp.resolve(i, line) for i, line in body]
@@ -490,6 +543,10 @@ class Emitter:
         out.append('}')
         self.stats['functions'] += 1
         self.stats['instructions'] += len(insns)
+        if resume:
+            rf = f'fb_{entry:x}' if all_labels else f'fr_{entry:x}'
+            for pc in resume:
+                self.resumes[pc] = rf
         return out, refs
 
 
@@ -571,6 +628,7 @@ def _emit_chunk(task):
     e = _emitter(name)
     e.stats.clear()
     e.unsupported.clear()
+    e.resumes = {}
     text = chunk_text(name, number, e, fns)
     error = None
     try:
@@ -579,19 +637,24 @@ def _emit_chunk(task):
         written, error = False, f'{path}: {ex}'
     return {'module': name, 'number': number, 'file': Path(path).name, 'functions': len(fns), 'bytes': len(text),
             'written': written, 'error': error, 'seconds': time.perf_counter() - t0, 'stats': dict(e.stats),
-            'unsupported': dict(e.unsupported)}
+            'unsupported': dict(e.unsupported), 'resumes': dict(e.resumes)}
 
 
 # ------------------------------------------------------------------------------------------------ driver
 
-def table_text(name, addrs):
+def table_text(name, addrs, resumes=None):
+    """Function starts plus resume points (a longjmp returns into the middle of a function), sorted for rt_dispatch."""
+    entries = {a: fname(a) for a in addrs}
+    for pc, fn in (resumes or {}).items():
+        entries.setdefault(pc, fn)
+    items = sorted(entries.items())
     lines = [header(f'{name} function table'), '#include "cpu.h"\n\n']
-    lines += [f'void {fname(a)}(Cpu *c);\n' for a in addrs]
+    lines += [f'void {fn}(Cpu *c);\n' for _, fn in items]
     lines.append(f'\nconst uint64_t {name}_fn_addrs[] = {{\n')
-    lines.append(',\n'.join(hx(a) for a in addrs))
+    lines.append(',\n'.join(hx(pc) for pc, _ in items))
     lines.append(f'\n}};\nconst GuestFn {name}_fn_ptrs[] = {{\n')
-    lines.append(',\n'.join(fname(a) for a in addrs))
-    lines.append(f'\n}};\nconst uint64_t {name}_fn_count = {len(addrs)};\n')
+    lines.append(',\n'.join(fn for _, fn in items))
+    lines.append(f'\n}};\nconst uint64_t {name}_fn_count = {len(items)};\n')
     return ''.join(lines)
 
 
@@ -707,11 +770,13 @@ def main():
         rs = sorted(results[name], key=lambda r: r['number'])
         moddir = d['moddir']
         stats, unsupported = Counter(), Counter()
+        resumes = {}
         for r in rs:
             stats.update(r['stats'])
             unsupported.update(r['unsupported'])
+            resumes.update(r['resumes'])
         t = time.perf_counter()
-        table_written = write_if_changed(moddir / f'{name}_table.c', table_text(name, d['emitted']))
+        table_written = write_if_changed(moddir / f'{name}_table.c', table_text(name, d['emitted'], resumes))
         removed = remove_stale(moddir, name, d['chunks'], errors)
         manifest = {
             'module': name,

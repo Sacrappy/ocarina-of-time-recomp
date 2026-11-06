@@ -2570,8 +2570,8 @@ static void cst_end(VkExec *ex, int pair, const GfxShader *cs, const uint32_t gr
 }
 
 // OOT_SKIP_CS=all|<hex>[,<hex>...]|!<hex>[,...] (diagnostic): compute dispatches of every shader, of those whose input
-// id starts with one of the prefixes, or (!) of all but those, are not recorded; for finding the kernel behind a GPU timeout (2026-11-06: the
-// Kokiri Forest level loses the device on its first frames). Logs each shader it skips once.
+// id starts with one of the prefixes, or (!) of all but those, are not recorded; for finding the kernel behind a GPU
+// timeout (2026-11-06: the Kokiri Forest level loses the device on its first frames). Logs each shader it skips once.
 static int skip_cs(const GfxShader *cs) {
     const char *e = getenv("OOT_SKIP_CS");
     if (!e || !*e) return 0;
@@ -2595,6 +2595,114 @@ static int skip_cs(const GfxShader *cs) {
     return skip;
 }
 
+
+
+// OOT_GAME_UPSCALER=bilinear: the game's neural upscaler runs as compute kernels on the SM86 tensor cores
+// (HMMA/LDSM/MOVM). By default they run on the host tensor cores through cooperative matrices (translator patch 0016,
+// vk_caps.c tensor_cores, 60 fps on the title). bilinear is the fallback for a device without that shape: the
+// network's intermediate passes are skipped and its final pass -- measured as a 0x54-byte push with 3 storage buffers,
+// 4 textures and 2 images, sampling the tonemapped frame through texture slot 0 and writing the presented picture
+// through image slot 1 (docs/phase3.md, 2026-11-06) -- is replaced by a linear blit of that frame. A final pass whose
+// blit cannot be recorded is left to the exact path instead of going black.
+static int game_upscaler_bilinear(void) { return !strcmp(cfg_value("OOT_GAME_UPSCALER"), "bilinear"); }
+
+// 1 when the compute program's SM86 code holds a tensor-core instruction: the opcode is the low 12 bits of the first
+// word, HMMA 0x23c, LDSM 0x83b and MOVM 0x23a (sm86_lower.c lower_hmma, lower_ldsm, lower_movm).
+static int cs_tensor(const VkExec *ex) {
+    const uint8_t *ctl, *code;
+    uint32_t len;
+    if (!ex->prog || !vk_exec_find_stage(ex->prog, NVN_STAGE_CS, &ctl, &code, &len)) return 0;
+    for (uint32_t i = 0; i + 16 <= len; i += 16) {
+        uint32_t w;
+        memcpy(&w, code + i, 4);
+        switch (w & 0xfff) {
+        case 0x23c: case 0x83b: case 0x23a: return 1;
+        default: break;
+        }
+    }
+    return 0;
+}
+
+// The upscaler's final pass: the pushed parameter block, its slot counts (sm86_lower.h Sm86Control +0xb2/+0xb3/+0xb6).
+static int ndsr_final(const VkExec *ex) {
+    uint32_t base, ns, nt, ni;
+    return nvn2_cs_layout(ex, &base, &ns, &nt, &ni) && ex->push_cc_len == 0x54 && ns == 3 && nt == 4 && ni == 2;
+}
+
+// The final pass's input (texture slot 0) and output (image slot 1), blitted linearly. 0 when they cannot be resolved or
+// the blit cannot be recorded, so the caller runs the program instead.
+static int ndsr_blit(VkExec *ex) {
+    uint64_t hs = ex->tex[NVN_STAGE_CS][0], hd = ex->img[NVN_STAGE_CS][1];
+    if (!hs || !hd) return 0;
+    vk_exec_barrier(ex);   // end an open pass first: ending it marks its targets GPU-written, which takes the texture lock
+    vk_texture_lock();
+    view_t v;
+    int hv = 0;
+    const VkTexImage *s = vk_texture_by_id_locked((int)(hs & 0xfffff), &v, &hv);
+    const VkTexImage *d = vk_texture_by_id_locked((int)(hd & 0xfffff), &v, &hv);
+    int ok = vk_exec_blit_linear(ex, s, d);
+    if (ok) vk_texture_gpu_written_id((int)(hd & 0xfffff));
+    static int logged;
+    if (logged++ < 8)
+        rt_log("vk: game upscaler (OOT_GAME_UPSCALER=bilinear): %s %ux%u fmt %d -> %ux%u fmt %d", ok ? "blit" : "no blit",
+               s ? s->width : 0, s ? s->height : 0, s ? (int)s->format : 0,
+               d ? d->width : 0, d ? d->height : 0, d ? (int)d->format : 0);
+    vk_texture_unlock();
+    return ok;
+}
+
+// 1 when the dispatch was replaced (recorded as a blit, or skipped): the caller must not run the program.
+static int game_upscaler_instead(VkExec *ex) {
+    if (!game_upscaler_bilinear() || !cs_tensor(ex)) return 0;
+    if (ndsr_final(ex)) return ndsr_blit(ex);
+    return 1;   // an intermediate network pass: nothing it computes reaches the picture once the final pass is a blit
+}
+
+// OOT_CS_LOG=<n> (diagnostic): the first n compute dispatches from frame 290 on, with the NVN2 bank-0 layout and the
+// resource each reflected slot resolves to. The game's video path runs its upscaler on compute; this identifies the
+// pass whose output is the presented picture before that pass is replaced with a blit.
+static void cs_log(VkExec *ex, const GfxShader *cs, const p_dispatch *d, const char *kind) {
+    static int limit = -2;
+    static long seen;
+    if (limit == -2) { const char *e = getenv("OOT_CS_LOG"); limit = e ? atoi(e) : 0; }
+    if (limit <= 0 || seen >= limit) return;
+    uint32_t base, ns, nt, ni;
+    if (!nvn2_cs_layout(ex, &base, &ns, &nt, &ni)) return;
+    seen++;
+    uint64_t k = 0;
+    const uint8_t *iid = gfx_shader_input_id(cs);
+    if (iid) memcpy(&k, iid, sizeof k);
+    rt_log("cslog: f%llu %s key %016llx grid %dx%dx%d push %#x base %#x ns %u nt %u ni %u",
+           (unsigned long long)gfx_stats().frames, kind, (unsigned long long)k, d->x, d->y, d->z, ex->push_cc_len,
+           base, ns, nt, ni);
+    const GfxShaderRes *res;
+    int n = gfx_shader_resources(cs, GFX_RES_SSBO, &res);
+    vk_texture_lock();
+    for (int i = 0; i < n && i < 16; i++) {
+        int s = res[i].slot;
+        if (s < 0 || s >= 16) continue;
+        rt_log("cslog:   ssbo slot %d written %d handle %#x -> %#llx +%#llx", s, res[i].flags & 1, res[i].handle,
+               (unsigned long long)ex->ssbo[NVN_STAGE_CS][s].addr, (unsigned long long)ex->ssbo[NVN_STAGE_CS][s].size);
+    }
+    const char *what[2] = {"tex", "img"};
+    for (int kind_i = 0; kind_i < 2; kind_i++) {
+        n = gfx_shader_resources(cs, kind_i ? GFX_RES_IMG : GFX_RES_TEX, &res);
+        for (int i = 0; i < n && i < 128; i++) {
+            uint64_t h = vk_exec_res_handle(ex, NVN_STAGE_CS, &res[i], 0, kind_i);
+            int ckind = -1, cslot = res[i].cbuf_slot == 0 ? nvn2_c0_slot(ex, (uint32_t)res[i].handle * 4, &ckind) : -1;
+            view_t v;
+            int hv = 0;
+            const VkTexImage *t = h ? vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv) : NULL;
+            rt_log("cslog:   %s slot %d flags %u cbuf %d handle %#x off %#x -> %s[%d] h %#llx -> %s %ux%u fmt %#x addr %#llx",
+                   what[kind_i], res[i].slot, res[i].flags, res[i].cbuf_slot, res[i].handle,
+                   (unsigned)res[i].handle * 4, ckind < 0 ? "-" : ckind == 0 ? "ssbo" : ckind == 1 ? "tex" : "img", cslot,
+                   (unsigned long long)h, t ? "" : "none", t ? t->width : 0, t ? t->height : 0,
+                   t ? (unsigned)t->format : 0, t ? (unsigned long long)t->addr : 0);
+        }
+    }
+    vk_texture_unlock();
+}
+
 static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (d->x <= 0 || d->y <= 0 || d->z <= 0) return;
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
@@ -2604,12 +2712,14 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
         if (skip_from == -2) { const char *e = getenv("OOT_SKIP_DISPATCH_FROM"); skip_from = e ? atoll(e) : -1; }
         if (skip_from >= 0 && count++ >= skip_from) return;
     }
+    if (game_upscaler_instead(ex)) return;
     cb_res(ex);
     dummies_init();
     int present;
     const GfxShader *cs = shader_for(ex, NVN_STAGE_CS, &present, NULL, 0);   // synchronous: a skipped dispatch changes results
     if (!cs) return;
     if (skip_cs(cs)) return;
+    cs_log(ex, cs, d, "dispatch");
     const VkPipeInfo *info = NULL;
     VkPipeline p = vk_pipeline_compute(cs, &info);
     if (!p || !info) return warn_once(W_PIPELINE, "a compute pipeline could not be created: dispatches with it are skipped");
@@ -2681,12 +2791,14 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     VkMemSpan ip;
     if (!vk_mem_resolve(d->ind, sizeof(VkDispatchIndirectCommand), &ip) || ip.offset % 4)
         return warn_once(W_INDIRECT, "indirect dispatch arguments at %#llx are not backed or not aligned: skipped", (unsigned long long)d->ind);
+    if (game_upscaler_instead(ex)) return;
     cb_res(ex);
     dummies_init();
     int present;
     const GfxShader *cs = shader_for(ex, NVN_STAGE_CS, &present, NULL, 0);
     if (!cs) return;
     if (skip_cs(cs)) return;
+    cs_log(ex, cs, &(p_dispatch){0, 0, 0, d->caller}, "dispatch-ind");
     const VkPipeInfo *info = NULL;
     VkPipeline p = vk_pipeline_compute(cs, &info);
     if (!p || !info) return warn_once(W_PIPELINE, "a compute pipeline could not be created: dispatches with it are skipped");

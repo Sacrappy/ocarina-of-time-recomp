@@ -21,6 +21,10 @@
 # vk_present = mailbox
 # Which GPU, by index in the Vulkan device list (the best one when unset).
 # gpu_index = 0
+# The game's own neural upscaler (the tensor-core network behind the cinematics and the in-game image): tensor runs
+# the network on the GPU's cooperative-matrix tensor cores (exact), bilinear replaces it with a linear blit of its
+# input (fallback for GPUs without cooperative matrices).
+# game_upscaler = tensor
 
 [language]
 # The game's language, a Switch language code: ja, en-US, en-GB, fr, fr-CA, de, it, es, es-419, zh-Hans, zh-Hant, ko
