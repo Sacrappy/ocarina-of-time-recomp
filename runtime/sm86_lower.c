@@ -1152,11 +1152,10 @@ static void lower_iadd3(L *l, const Insn *x, uint32_t op) {
 static void lower_lea(L *l, const Insn *x, uint32_t op) {
     uint32_t rd = bits(x, 16, 8), shift = bits(x, 75, 5), cout = bits(x, 81, 3);
     Src a = src0(x, 0), b = srcn(l, x, 1, 0);
-    int neg_b = op == 0x811 ? 0 : bits(x, 63, 1), neg_a = bits(x, 72, 1);
+    int neg_b = b.kind != 1 && bits(x, 63, 1), neg_a = bits(x, 72, 1);   // an immediate carries its sign at 63
     int ext = bits(x, 74, 1);
     uint32_t cin = bits(x, 87, 3), cin_inv = bits(x, 90, 1);
     if (!ext && bits(x, 87, 4) != 15) return (void)fail(l, "LEA carry in without .X");
-    if (neg_b) return (void)fail(l, "LEA negated addend");
     if (bits(x, 80, 1)) {
         // LEA.HI: Rd = Rb + the high word of (Rc:Ra << shift): SHF.L Rt = (Rc:Ra) << shift high, or a right shift
         // of Ra by 32 - shift when Rc is RZ (sign-extended by 73); then the add, with a carry out when asked.
@@ -1184,12 +1183,13 @@ static void lower_lea(L *l, const Insn *x, uint32_t op) {
     if (cout == 7 && !ext) {
         int is32;
         uint64_t w = b_slot(l, b, 0x5bd0000000000000ull, 0x4bd0000000000000ull, 0x36d0000000000000ull, 0, 0, 1, &is32);
-        emit(l, w | l->pred | rd | ((uint64_t)a.reg << 8) | ((uint64_t)shift << 39) | ((uint64_t)neg_a << 45));
+        emit(l, w | l->pred | rd | ((uint64_t)a.reg << 8) | ((uint64_t)shift << 39) | ((uint64_t)neg_a << 45) |
+                    ((uint64_t)neg_b << 48));   // ISCADD's negate addend
         return;
     }
     // With a carry out or in: Ryujinx ignores Maxwell LEA's carry predicate and X, so the sum is made by hand:
     // t = (a << shift) + b, the carry out Pc = t < b (unsigned), the carry in added from its predicate.
-    if (neg_a) return (void)fail(l, "LEA carry with a negated source");
+    if (neg_a || neg_b) return (void)fail(l, "LEA carry with a negated source");
     uint32_t t = S(l, 2), rb = to_reg(l, b, 1, 0, 0);
     emit(l, base(l, 0x3848000000000000ull, t, a.reg) | ((uint64_t)shift << 20));   // SHL imm
     emit(l, base(l, 0x5c10000000000000ull, t, t) | ((uint64_t)rb << 20));
@@ -1415,6 +1415,25 @@ static void lower_ipa(L *l, const Insn *x) {
                 ((uint64_t)7 << 47) | ((uint64_t)bits(x, 76, 2) << 52) | ((uint64_t)bits(x, 78, 1) << 55));
 }
 
+// IPA.PASS / CONSTANT whose attribute byte address is indexed by a uniform register (0x526): Maxwell IPA.IDX reads
+// the whole byte address from Ra, so add the instruction's base address (attribute dwords at 64-71, times four) to
+// the uniform register first. URZ as the index is the plain attribute fetch. Lichii's lower_to_maxwell (case 0x526)
+// is the reference for the fields: bits 32-39 must be RZ, 76-79 0 or 4 (sample mode 0), 81-83 7.
+static void lower_ipa_indexed(L *l, const Insn *x) {
+    uint32_t rd = bits(x, 16, 8), attr = bits(x, 64, 8), mode = bits(x, 76, 4);
+    if (bits(x, 32, 8) != RZ || (mode != 0 && mode != 4) || bits(x, 81, 3) != 7) return (void)fail(l, "indexed IPA mode");
+    uint32_t idx = ur(l, bits(x, 24, 8));
+    if (idx == RZ) {   // URZ: the plain attribute address in the instruction
+        emit(l, base(l, 0xe000000000000000ull, rd, RZ) | ((uint64_t)RZ << 20) | ((uint64_t)(attr * 4) << 28) |
+                    ((uint64_t)7 << 47) | ((uint64_t)bits(x, 76, 2) << 52) | ((uint64_t)bits(x, 78, 1) << 55));
+        return;
+    }
+    uint32_t t = S(l, 0);
+    emit(l, 0x1c00000000000000ull | l->pred | t | ((uint64_t)idx << 8) | ((uint64_t)(attr * 4) << 20));   // IADD32I
+    emit(l, base(l, 0xe000000000000000ull, rd, t) | ((uint64_t)RZ << 20) | ((uint64_t)(attr * 4) << 28) |
+                ((uint64_t)7 << 47) | ((uint64_t)1 << 38) | ((uint64_t)bits(x, 78, 1) << 55));
+}
+
 // ALD / AST: address 40-49 (bytes), components 74-75 (+ 1), patch 76, output 79; the vertex index register
 // at 32-39 (ALD) or 64-71 (AST); AST's data at 32-39. Maxwell ALD/AST with the same fields.
 static void lower_ald_ast(L *l, const Insn *x, int store) {
@@ -1587,6 +1606,18 @@ static void lower_suld(L *l, const Insn *x) {
     uint32_t hr = to_reg(l, h, 4, 0, 0);
     emit(l, 0xeb00000000000000ull | l->pred | rd | ((uint64_t)coord << 8) | ((uint64_t)mask << 20) | ((uint64_t)PT << 30) |
                 ((uint64_t)dim << 33) | ((uint64_t)hr << 39));
+}
+
+// SURED (0x59f): a surface reduction (.ADD.U32 on a direct descriptor): the data register at 32-39, coordinates at
+// 24-31, dimension at 61-63 (1 buffer, 3 2D), descriptor dword at 40-53 and bank at 54-58. Maxwell SURED takes the
+// same fields; the memory-ordering flags in the top byte of word 2 do not change the value that is reduced.
+static void lower_sured(L *l, const Insn *x) {
+    uint32_t data = bits(x, 32, 8), coord = bits(x, 24, 8), dim = bits(x, 61, 3), off = bits(x, 40, 14), bank = bits(x, 54, 5);
+    if ((x->w[2] & 0x00ffffffu) != 0x0010e000u || (dim != 1 && dim != 3) || bank >= 18 || off > 0x1fff ||
+        bits(x, 59, 2) || coord > 253)
+        return (void)fail(l, "SURED mode");
+    emit(l, 0xeb40000000000000ull | l->pred | data | ((uint64_t)coord << 8) | ((uint64_t)dim << 33) |
+                ((uint64_t)off << 36) | ((uint64_t)1 << 51));
 }
 
 // ---- tensor-core instructions (Turing+), emulated with shuffles and half-precision FMAs
@@ -2836,6 +2867,7 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0x301: return lower_brev(l, x);
     case 0x230: case 0x430: case 0x630: return lower_hadd2(l, x, op);
     case 0x326: return lower_ipa(l, x);
+    case 0x526: return lower_ipa_indexed(l, x);
     case 0x321: return lower_ald_ast(l, x, 0);
     case 0x322: return lower_ald_ast(l, x, 1);
     case 0xb82: return lower_ldc(l, x);
@@ -2846,6 +2878,7 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0x386: case 0x986: return lower_stg(l, x, op);
     case 0xb60: case 0xf60: case 0x361: return lower_tex(l, x, op);
     case 0xb9b: return lower_sust(l, x);
+    case 0x59f: return lower_sured(l, x);
     case 0xb97: return lower_suld(l, x);
     case 0x231: case 0x431: case 0x631: case 0x831: case 0xa31: return lower_hfma2(l, x, op);
     case 0x23e: return lower_f2fp(l, x, op);
