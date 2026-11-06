@@ -733,6 +733,21 @@ static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
     r->slot = (int16_t)handle_slot(kind, r->cbuf_slot, handle, r->separate);
 }
 
+// Ryujinx's SamplerType.None (0) names the sampler array GenerateBindlessAccess pairs with a texture array; every other
+// kind is a texture array of one dimension, with the flags of GfxShaderRes.type (0x100 array, 0x400 shadow).
+int gfx_pool_is_sampler(const GfxShaderRes *r) { return r->type == 0; }
+
+int gfx_pool_binding(uint16_t t) {
+    int shadow = (t & 0x400) != 0, arr = (t & 0x100) != 0;
+    if (t & 0x200) return -1;   // multisample: never a pool array
+    switch (t & 0xff) {
+    case 3: return shadow ? (arr ? GFX_POOL_TEX_2D_ARRAY_SHADOW : GFX_POOL_TEX_2D_SHADOW) : (arr ? GFX_POOL_TEX_2D_ARRAY : GFX_POOL_TEX_2D);
+    case 4: return GFX_POOL_TEX_3D;
+    case 5: return GFX_POOL_TEX_CUBE;
+    default: return -1;         // 1D, buffer and rect have no array form here
+    }
+}
+
 // SPIR-V opcodes and enumerants used below (SPIR-V 1.6 specification, section 3).
 enum { OP_ENTRY_POINT = 15, OP_EXECUTION_MODE = 16, OP_TYPE_INT = 21, OP_TYPE_FLOAT = 22, OP_TYPE_VECTOR = 23, OP_CONSTANT = 43,
        OP_TYPE_ARRAY = 28, OP_TYPE_POINTER = 32, OP_VARIABLE = 59, OP_DECORATE = 71,

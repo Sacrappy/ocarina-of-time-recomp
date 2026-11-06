@@ -124,3 +124,18 @@ Pools on the host:
 ## Status
 
 - 2026-11-06: findings above; nothing implemented.
+- 2026-11-06, later: steps 2-6 implemented (commit on `bindless`; `build/bindless-report.md` has the measurements).
+  `Program.cs` answers the measured pool lengths (33068 texture, 4096 sampler) and
+  `QueryHostSupportsShaderNonUniformIndexing` true; a pool array takes one binding number, not one per element. The
+  host checks the descriptor-indexing features in `vk_device.c` (`OOT_POOL_ARRAYS=0` disables the path) and keeps the
+  arrays in a descriptor set of their own (`vk_pipeline.c pool_layout`: one binding per view kind, UPDATE_AFTER_BIND and
+  PARTIALLY_BOUND, at set index 1, or 2 with independent layouts). `spirv_pool` moves each stage's pool arrays there and
+  renumbers them, so `bind_resources` never writes them; `vk_exec_draw.c pool_set` writes the set once per bound pool
+  pair and then only refreshes the elements whose slot token changed. The fill is progressive
+  (`OOT_POOL_FILL_PER_FRAME`, 4096 elements a frame): a one-shot fill of every pool id ends in
+  `VK_ERROR_DEVICE_LOST` on this GPU. Measured: the 2D array resolves 7688 of 33068 ids (the rest are unregistered ids
+  that get the placeholder), the sampler array is empty at the level's first pool-array draw because the bound sampler
+  pool has no registrations yet. The draw path itself is still untested end to end: the level's first frame dies in the
+  guest at `main+0x166215c` (the mid-function-return bug the `snapshot` branch fixes), in both the old and the new code,
+  so no level frame is ever presented and no screenshot can show the materials yet.
+

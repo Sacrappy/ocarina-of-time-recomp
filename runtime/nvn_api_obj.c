@@ -79,6 +79,7 @@ NVN_API(nvnSamplerPoolInitialize) {
 NVN_API(nvnSamplerPoolFinalize) { (void)c; }
 // void nvnSamplerPoolRegisterSampler(const NVNsamplerPool *sp, int id, const NVNsampler *s)
 NVN_API(nvnSamplerPoolRegisterSampler) {
+    NVN_LOG("SamplerPoolRegisterSampler %d", (int)arg_x(c, 1));
     gfx_backend()->sampler_register(nvn_spool_slot(arg_p(c, 0), (int)arg_x(c, 1)), &((const samp_t *)arg_p(c, 2))->p);
 }
 

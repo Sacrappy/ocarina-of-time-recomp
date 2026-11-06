@@ -42,7 +42,8 @@ PROCS = ("oot.exe", "oot_xlate.exe")
 
 
 def running() -> list[str]:
-    out = subprocess.run(["tasklist.exe"], capture_output=True, text=True).stdout.lower()
+    # tasklist.exe writes in the console's OEM code page, which is not UTF-8 on a French Windows: decode leniently.
+    out = subprocess.run(["tasklist.exe"], capture_output=True).stdout.decode("utf-8", "replace").lower()
     return [p for p in PROCS if p in out]
 
 

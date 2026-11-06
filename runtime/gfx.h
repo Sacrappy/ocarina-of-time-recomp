@@ -97,6 +97,22 @@ typedef struct {
     uint8_t pool_array;         // TEX: Ryujinx's bindless pool array (handle 0x40000000), filled from the bound pool
 } GfxShaderRes;
 typedef struct { uint8_t type, comps, packed; } GfxShaderIo;   // GFX_TYPE_*, components, 1 with a Component decoration
+
+// Ryujinx's bindless pool arrays (Translation/Optimizations/BindlessElimination.cs GenerateBindlessAccess): a texture
+// or sampler handle loaded from a constant buffer turns into `array[min(id, length - 1)]`, where the id indexes the NVN
+// pool bound with SetTexturePool / SetSamplerPool. The lengths are the measured pool sizes of this game's pools
+// (`nvn: TexturePool n=33068`, `nvn: SamplerPool n=4096` in an OOT_TRACE=gfx log), and tools/xlate/Program.cs answers
+// the same numbers so the shader's clamp and the host's arrays agree. A pool with more descriptors than this needs both
+// bumped; nvn_api_obj.c's dpool_slot says so (it refuses a pool beyond the slot space a handle can name).
+#define GFX_POOL_TEX_SLOTS  33068
+#define GFX_POOL_SAMP_SLOTS 4096
+// The host keeps these arrays in a descriptor set of their own, one binding per kind, every element indexed by NVN pool
+// id (runtime/vk_pipeline.c pool_layout, runtime/vk_exec_draw.c pool_set). Which binding a pool array of a given
+// SamplerType goes to; -1 for a kind the host cannot bind (nothing is bound, and the draw samples the placeholder).
+enum { GFX_POOL_SAMP, GFX_POOL_TEX_2D, GFX_POOL_TEX_2D_ARRAY, GFX_POOL_TEX_2D_SHADOW, GFX_POOL_TEX_2D_ARRAY_SHADOW,
+       GFX_POOL_TEX_CUBE, GFX_POOL_TEX_3D, GFX_POOL_KINDS };
+int gfx_pool_binding(uint16_t sampler_type);                 // a GFX_POOL_* binding, -1 for an unsupported kind
+int gfx_pool_is_sampler(const GfxShaderRes *r);              // 1: the sampler array (type 0, Ryujinx's SamplerType.None)
 int gfx_shader_stage(const GfxShader *s);                   // GFX_STAGE_VS, GFX_STAGE_FS or GFX_STAGE_CS
 int gfx_shader_resources(const GfxShader *s, int kind, const GfxShaderRes **res);   // count of GFX_RES_* kind; array in *res
 uint32_t gfx_shader_slot_mask(const GfxShader *s);                    // texture/image slots whose type its translation read
