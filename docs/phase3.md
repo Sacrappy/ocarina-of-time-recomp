@@ -447,3 +447,32 @@ stub and `"\mp4"` escape to report upstream.
   `src/video_core/shader_environment.cpp`. Behaviour only, never code.
 - Nothing from the game is committed; everything extracted or decompressed stays under `build/` (the decompressed
   bfsha of this session lived in the scratchpad and is gone; regenerate it from the RomFS image).
+
+## Status (2026-11-07, gameplay and the level's first real frames)
+
+The opening no longer ends in a trap: the level runs, the forest draws, and the HUD, area name and minimap are
+correct. Four threads of work got here.
+
+- `longjmp` (commit `303b541` and the generator's `fr_` work): a longjmp restores the guest registers and sp and
+  branches into the middle of the function that called `setjmp`, from a host stack that is not that function's. The
+  generator now makes every call return address a dispatch entry and a return of a resumed function dispatches to
+  its restored x30 instead of unwinding into the longjmp call site (`Cpu.resumed`, `recomp/gen.py`). main calls
+  `setjmp` through a function pointer (`main+0x60be8`), which the generator cannot see, so an observer on the
+  `longjmp`/`_longjmp` imports marks the chain (`rt_original_resumed`, `runtime/ov_system.c`). Before this, the game
+  fell into the `udf` after `main+0x1662158` and died at `main+0x166215c`.
+- The SM86 lowering (`runtime/sm86_lower.c`): TLD's packed 4-bit texel offsets and 2D y coordinate at Ra+1, indexed
+  IPA (`0x526`), SURED (`0x59f`), and LEA's negated addend (bit 63 is the immediate's sign for immediate forms).
+  156 of the 193 programs that failed offline now lower (67 at the start of the day). Remaining: `0x243` (packed
+  F2I to bytes, 16), uniform predicate pressure (12), scratch pressure (9).
+- Bindless (the reference's `d84bf5d`, merged): pool-indexed textures go through a persistent update-after-bind set;
+  a feedback buffer records the ids the GPU samples and only those textures are created (creating every live pool
+  texture overflowed the VRAM), NonUniform indexing stays off. The replay's pool work is now about 0.2 ms a frame
+  (18-22 ids wanted, 30 resolves, ~200 descriptor writes per window) instead of the ~100 ms the per-draw scan of
+  33068 entries cost. Pool statistics: `OOT_TRACE=gfx` (the `pool sets:` lines).
+- The level itself: with `OOT_SKIP_CS=1a62084a` (the volumetric fog) the 3D scene reaches the screen; without it the
+  fog kernel's NaN turns the tonemap/upscaler output black. Measured on the save + dense-A route at 2560x1440: the
+  level loads at world ~26 s; the frame costs 500-1000 ms on the GPU (2 fps) and about 90-220 ms of CPU replay
+  (`--seconds 70`, `OOT_TRACE=perf`). Most geometry is overexposed white/black, so the materials are still wrong.
+- Open: the fog kernel's NaN, the overexposed materials (and whether they share one cause), the level's GPU cost
+  (hundreds of unique programs, 3000+ draws), and the remaining lowering programs. The start-up `0xc0000005` and the
+  occasional `vk: upload submit failed (-4)` (VRAM at 11.0 of 11.9 GB) still take retries.

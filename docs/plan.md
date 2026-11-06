@@ -192,3 +192,12 @@ The copy of 2026-11-05, from metroid-prime-4-recomp @ `586e91e`: 606 tracked fil
 file's first line says which. Not taken: `recomp/patches-v131072.txt`, `tools/data/expected-v1.0.0.json`,
 `tools/data/expected-v1.1.0.json`. Unrenamed on purpose: `tools/vendor/` and `tools/xlate/patches/`, whose "MP4"
 comments record where a change was made.
+
+## 2026-11-07: gameplay past the opening
+
+The longjmp resume chain (`recomp/gen.py`, `Cpu.resumed`, the `longjmp`/`_longjmp` observer) got the game past
+`main+0x166215c` and into the Kokiri Forest on the user's save; the SM86 lowering batch (TLD offsets, indexed IPA,
+SURED, LEA) lifted 156 of the 193 failing programs; the reference's bindless pool set with GPU sampling feedback
+(`d84bf5d`) replaced the per-draw pool scan that cost about 100 ms a frame. The level draws (3D with
+`OOT_SKIP_CS=1a62084a`), the HUD and the minimap render, and the frame is now GPU-bound (2 fps at 2560x1440) with the
+fog NaN and overexposed materials open. Details in `docs/phase3.md`.
