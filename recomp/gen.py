@@ -377,16 +377,20 @@ class Emitter:
         all_labels = 'all' in tables.values()
         if all_labels:
             labels = set(range(entry, end, 4))
-        # Resume points: the instruction after a call to a PLT stub. A setjmp/longjmp returns to the setjmp call's
-        # return address from a different host stack, so rt_dispatch must be able to enter this function there (fr_
-        # below, or fb_ for all-label functions). Direct calls to known functions never need one: only setjmp returns
-        # twice. They become labels, so the switch can jump to them after the prologue.
+        # Resume points: the instruction after every call. A longjmp restores the guest registers and sp and re-enters
+        # the guest at the setjmp call's return address from a different host stack; the functions it returns through
+        # must also re-enter where their own calls returned, so every return address is a dispatch entry (fr_ below,
+        # or fb_ for all-label functions) and a return in a resumed function dispatches instead of returning through
+        # the C stack. setjmp_resume marks the entries that *start* such a chain.
+        setjmp_resume = set()
         resume = set()
         for i, ins in enumerate(insns):
-            if ins.kind == 'bl' and ins.target in self.plt:
+            if ins.kind in ('bl', 'blr'):
                 r = entry + 4 * i + 4
                 if entry <= r < end and r not in self.starts:
                     resume.add(r)
+                    if ins.kind == 'bl' and ins.target in self.plt:
+                        setjmp_resume.add(r)
         labels |= resume
         # An unresolved computed br re-enters the function through fb_<entry>, a C function of its own, which local
         # flags would not survive; such functions keep NZCV in c->nzcv.
@@ -424,34 +428,38 @@ class Emitter:
             # instruction. A goto to a shared dispatch block inside the body instead turns every instruction into
             # a loop header, and clang's loop passes then take tens of seconds on one function.
             fb = f'fb_{entry:x}'
-            cases = ' '.join(f'case {hx(t)}: goto L_{t:x};' for t in range(entry, end, 4))
+            cases = ' '.join(f'case {hx(t)}: {"resumed = 1; c->resumed = 1; " if t in setjmp_resume else ""}'
+                             f'goto L_{t:x};' for t in range(entry, end, 4))
             redispatch = f'{MUSTTAIL} {fb}(c);'
             out = [f'void {fb}(Cpu *c);',
                    f'void {fname(entry)}(Cpu *c) {{', f'    FN_ENTER({hx(entry)});', f'    c->pc = {hx(entry)};',
                    f'    {redispatch}', '}',
-                   f'void {fb}(Cpu *c) {{', f'    switch (c->pc) {{ {cases} default: break; }}',
+                   f'void {fb}(Cpu *c) {{', f'    FN_ENTER({hx(entry)});', f'    int resumed = c->resumed;',
+                   f'    switch (c->pc) {{ {cases} default: break; }}',
                    f'    {MUSTTAIL} rt_dispatch(c);']
         else:
             redispatch = f'{MUSTTAIL} rt_dispatch(c);'
             if resume:
                 # The body moves into fr_<entry>, which switches on c->pc after the prologue; f_<entry> is the
                 # trampoline that enters at the function start. Both have the Cpu* signature the musttail branches in
-                # the body need. A longjmp restores the guest state and dispatch lands in fr_ at the call's return.
+                # the body need. A longjmp restores the guest state and dispatch lands in fr_ at the call's return;
+                # a return of a resumed function dispatches to its caller's return address instead of unwinding into
+                # the longjmp call site's host frame.
                 fr = f'fr_{entry:x}'
                 out = [f'void {fr}(Cpu *c);',
                        f'void {fname(entry)}(Cpu *c) {{ c->pc = {hx(entry)}; {fr}(c); }}',
-                       f'void {fr}(Cpu *c) {{', f'    FN_ENTER({hx(entry)});']
+                       f'void {fr}(Cpu *c) {{', f'    FN_ENTER({hx(entry)});', f'    int resumed = c->resumed;']
             else:
-                out = [f'void {fname(entry)}(Cpu *c) {{', f'    FN_ENTER({hx(entry)});']
+                out = [f'void {fname(entry)}(Cpu *c) {{', f'    FN_ENTER({hx(entry)});', f'    int resumed = c->resumed;']
             if fp.used:
                 out.append('    ' + fp.decl())
 
         def call(t, a):
             if t in starts:
                 refs.add(t)
-                return f'c->x[30] = {hx(a + 4)}; {spill}{fname(t)}(c);{reload_call}'
+                return f'c->resumed = 0; c->x[30] = {hx(a + 4)}; {spill}{fname(t)}(c);{reload_call}'
             self.stats['external_calls'] += 1
-            return f'c->x[30] = {hx(a + 4)}; {spill}c->pc = {hx(t)}; rt_dispatch(c);{reload_call}'
+            return f'c->resumed = 0; c->x[30] = {hx(a + 4)}; {spill}c->pc = {hx(t)}; rt_dispatch(c);{reload_call}'
 
         def op(i, code):
             code = fx(i, code)
@@ -501,7 +509,7 @@ class Emitter:
             elif k == 'bl':
                 emit(i, '    ' + call(ins.target, a))
             elif k == 'blr':
-                emit(i, f'    c->pc = {ins.target}; c->x[30] = {hx(a + 4)}; {spill}rt_dispatch(c);{reload_call}')
+                emit(i, f'    c->resumed = 0; c->pc = {ins.target}; c->x[30] = {hx(a + 4)}; {spill}rt_dispatch(c);{reload_call}')
             elif k == 'br':
                 jt = tables.get(a)
                 if jt == 'all':
@@ -513,7 +521,9 @@ class Emitter:
                 else:
                     emit(i, f'    {publish(i)}{spill}c->pc = {ins.target}; {MUSTTAIL} rt_dispatch(c);')
             elif k == 'ret':
-                emit(i, f'    {spill}return;')
+                # A resumed function returns through the guest: the host frames below the longjmp are not its
+                # caller's (musttail collapsed them), so dispatch to the restored x30 instead of unwinding.
+                emit(i, f'    {spill}if (resumed) {{ c->pc = c->x[30]; c->resumed = 1; {MUSTTAIL} rt_dispatch(c); }} return;')
             else:
                 raise ValueError(f'{a:#x}: unknown instruction kind {k!r}')
         n = len(insns)
@@ -533,7 +543,8 @@ class Emitter:
             if rp.regs:
                 out.append('    ' + rp.decl())
             if resume:
-                cases = ' '.join(f'case {hx(pc)}: goto L_{pc:x};' for pc in sorted(resume))
+                cases = ' '.join(f'case {hx(pc)}: {"resumed = 1; c->resumed = 1; " if pc in setjmp_resume else ""}'
+                                 f'goto L_{pc:x};' for pc in sorted(resume))
                 out.append(f'    switch (c->pc) {{ {cases} default: break; }}')
             self.stats['local_reg_functions'] += bool(rp.regs)
             self.stats['reg_spills'] += sum(len(s) for s in rp.spill)
@@ -649,7 +660,7 @@ def table_text(name, addrs, resumes=None):
         entries.setdefault(pc, fn)
     items = sorted(entries.items())
     lines = [header(f'{name} function table'), '#include "cpu.h"\n\n']
-    lines += [f'void {fn}(Cpu *c);\n' for _, fn in items]
+    lines += [f'void {fn}(Cpu *c);\n' for fn in sorted({fn for _, fn in items})]
     lines.append(f'\nconst uint64_t {name}_fn_addrs[] = {{\n')
     lines.append(',\n'.join(hx(pc) for pc, _ in items))
     lines.append(f'\n}};\nconst GuestFn {name}_fn_ptrs[] = {{\n')

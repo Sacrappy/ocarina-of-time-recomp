@@ -21,7 +21,8 @@ typedef struct __attribute__((aligned(16))) Cpu {
     uint64_t fpcr;           // 320: guest FPCR/FPSR (portable FP/SIMD lowering only; the asm path uses the host's)
     uint64_t fpsr;           // 328
     uint64_t excl_val_hi;    // 336: upper half of a 128-bit exclusive pair (LDXP/LDAXP of two X registers)
-    uint8_t _pad[512 - 344];
+    uint8_t resumed;         // 344: this function was entered as part of a longjmp resume chain (recomp/gen.py)
+    uint8_t _pad[512 - 345];
     __uint128_t v[32];       // 512
 } Cpu;
 

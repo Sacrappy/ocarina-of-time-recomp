@@ -198,12 +198,15 @@ uint64_t rt_call(Cpu *c, uint64_t fn, int n, ...) {
     for (int i = 0; i < n; i++) c->x[i] = va_arg(ap, uint64_t);
     va_end(ap);
     uint64_t lr = c->x[30], pc = c->pc;
+    uint8_t resumed = c->resumed;
     c->x[30] = RT_RET_HOST;
     c->pc = fn;
+    c->resumed = 0;    // this call returns to the host, so the callee must return through the C stack
     rt_fpcr_sync(c);   // guest code may start here on a host thread or fiber that has not run it
     rt_dispatch(c);
     c->x[30] = lr;
     c->pc = pc;
+    c->resumed = resumed;
     return c->x[0];
 }
 
@@ -216,8 +219,10 @@ uint64_t rt_original(Cpu *c) {
     if ((c->pc & 15) || i >= (uint64_t)nslots || !slots[i].original)
         rt_fatal("rt_original at %#llx: not inside an observer with a guest definition", (unsigned long long)c->pc);
     uint64_t lr = c->x[30], pc = c->pc;
+    uint8_t resumed = c->resumed;
     c->x[30] = RT_RET_HOST;
     c->pc = slots[i].original;
+    c->resumed = 0;    // the guest definition returns to the observer, not to a longjmp resume chain
     int *d = c->thread ? kern_host_depth(c->thread) : NULL;
     int depth = d ? *d : 0;
     if (d) __atomic_store_n(d, depth - 1, __ATOMIC_RELAXED);
@@ -225,5 +230,6 @@ uint64_t rt_original(Cpu *c) {
     if (d) __atomic_store_n(d, depth, __ATOMIC_RELAXED);
     c->x[30] = lr;
     c->pc = pc;
+    c->resumed = resumed;
     return c->x[0];
 }
