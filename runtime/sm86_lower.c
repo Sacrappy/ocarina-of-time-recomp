@@ -265,8 +265,10 @@ static uint32_t ur_dst(L *l, uint32_t n) { return ur_has_reg(l, n) ? ur(l, n) : 
 static uint32_t ur_pair(L *l, uint32_t n, int k) {
     if (n >= 63) return fail(l, "uniform register pair"), NOREG;
     Src lo = ur_src(l, n), hi = ur_src(l, n + 1);
-    if (lo.kind == 0 && hi.kind == 0 && hi.reg == lo.reg + 1) return lo.reg;
-    uint32_t a = S(l, k), b = S(l, k + 1);
+    // A 64-bit address pair must start on an even register (RED, LDG.64). An odd mirror pair goes through scratch.
+    if (lo.kind == 0 && hi.kind == 0 && hi.reg == lo.reg + 1 && !(lo.reg & 1)) return lo.reg;
+    int kk = (S(l, k) & 1) ? k + 1 : k;
+    uint32_t a = S(l, kk), b = S(l, kk + 1);
     if (b != a + 1) return fail(l, "scratch pair"), NOREG;
     if (lo.kind == 0 && lo.reg == RZ) mov_imm(l, a, 0); else to_reg_into(l, lo, a);
     if (hi.kind == 0 && hi.reg == RZ) mov_imm(l, b, 0); else to_reg_into(l, hi, b);
@@ -1517,7 +1519,7 @@ static void lower_ldg(L *l, const Insn *x, uint32_t op) {
 static void lower_stg(L *l, const Insn *x, uint32_t op) {
     uint32_t data = bits(x, 32, 8), size = bits(x, 73, 3), address = bits(x, 24, 8), offset = bits(x, 40, 24);
     if (size > 6 || bits(x, 16, 8)) return (void)fail(l, "STG mode");
-    if (data == RZ && size > 4) return (void)fail(l, "STG of wide zeros");
+    int zero_data = data == RZ && size > 4;   // a wide store of zeros: materialized below, after the address registers
     if (op == 0x986) {
         uint32_t ubase = ur_pair(l, bits(x, 64, 6), 2);
         int descriptor = (x->w[2] & ~(0x3fu | 0xe00u)) == 0x0c101100u;
@@ -1537,6 +1539,11 @@ static void lower_stg(L *l, const Insn *x, uint32_t op) {
         }
     } else if ((x->w[2] & ~0xe00u) != 0x0010a100u || (address & 1)) {
         return (void)fail(l, "STG register mode");
+    }
+    if (zero_data) {
+        if (size > 16) return (void)fail(l, "STG size");
+        data = S(l, 4);
+        for (uint32_t w = 4; w < 4 + size / 4; w++) mov_imm(l, S(l, w), 0);
     }
     emit(l, 0xeed8000000000000ull | l->pred | data | ((uint64_t)address << 8) | ((uint64_t)offset << 20) | ((uint64_t)1 << 45) |
                 ((uint64_t)size << 48));
@@ -1735,7 +1742,9 @@ static void lower_tex(L *l, const Insn *x, uint32_t op) {
     if (dim == 6 || bits(x, 77, 1) || bits(x, 81, 3) != 7 || bits(x, 59, 1) != (op == 0x361 ? 1u : 0u) ||
         (lod > 3 && lod != 6 && lod != 7) || (dc && mask != 1) || mask == 0)
         return (void)fail(l, "TEX mode");
-    if (!bits(x, 60, 1) && op != 0x361) return (void)fail(l, "TEX unpacked operands");
+    // Bit 60 clear is the same operand list for TEX and TEX.B here: the failing level shaders (2D, one LOD, bit 60
+    // clear) read (x, y | lod) from Ra/Rb exactly like the packed form, and the emulator's lowering treats it the same
+    // way. The only difference it encodes is TEX.B's split, which in_a below already handles.
     uint32_t coords = coord_count[dim];
     int has_lod = lod == 2 || lod == 3 || lod == 6 || lod == 7;
     uint32_t handle_slot = op == 0x361 ? 1 : 0;
@@ -2076,6 +2085,39 @@ static void lower_plop3(L *l, const Insn *x) {
     (void)fail(l, "PLOP3 table");
 }
 
+// UPLOP3 (0x89c): the same predicate LUT over uniform predicates; up() maps each UPn to the general predicate that
+// stands in for it, so the PSETP table search is the ordinary one with the operands mapped.
+static void lower_uplop3(L *l, const Insn *x) {
+    uint32_t pd = bits(x, 81, 3), pd2 = bits(x, 84, 3), lut = bits(x, 64, 3) | (bits(x, 72, 5) << 3);
+    uint32_t a = bits(x, 87, 4), b = bits(x, 77, 4), c = bits(x, 68, 4);
+    if (pd2 != 7 || bits(x, 16, 8) || x->w[1] || bits(x, 67, 1)) return (void)fail(l, "UPLOP3 mode");
+    if (pd == 7) return;
+    a = (a & 8) | up(l, a & 7), b = (b & 8) | up(l, b & 7), c = (c & 8) | up(l, c & 7);
+    pd = up(l, pd);
+    static const struct { uint32_t lut, op_ab, op_c; } tables[] = {
+        {0x80, 0, 0}, {0xfe, 1, 1}, {0xa8, 0, 1}, {0xea, 1, 0}, {0xf8, 0, 1}, {0xc0, 0, 0}, {0xfc, 1, 0}, {0x96, 2, 2},
+        {0x78, 0, 2}, {0x3c, 1, 2}, {0xe8, 2, 1}, {0xb8, 0, 0},
+    };
+    for (uint32_t n = 0; n < 8; n++) {
+        for (unsigned i = 0; i < sizeof tables / sizeof tables[0]; i++) {
+            uint32_t t = 0;
+            for (uint32_t v = 0; v < 8; v++) {
+                uint32_t u = v ^ n, va = u >> 2 & 1, vb = u >> 1 & 1, vc = u & 1, ab, r;
+                ab = tables[i].op_ab == 0 ? (va & vb) : tables[i].op_ab == 1 ? (va | vb) : (va ^ vb);
+                r = tables[i].op_c == 0 ? (ab & vc) : tables[i].op_c == 1 ? (ab | vc) : (ab ^ vc);
+                t |= r << v;
+            }
+            if (t != lut) continue;
+            uint32_t na = a ^ ((n >> 2 & 1) << 3), nb = b ^ ((n >> 1 & 1) << 3), nc = c ^ ((n & 1) << 3);
+            emit(l, 0x5090000000000000ull | l->pred | 7 | ((uint64_t)pd << 3) | ((uint64_t)(nc & 7) << 12) | ((uint64_t)(nc >> 3) << 15) |
+                        ((uint64_t)tables[i].op_ab << 24) | ((uint64_t)(nb & 7) << 29) | ((uint64_t)(nb >> 3) << 32) |
+                        ((uint64_t)(na & 7) << 39) | ((uint64_t)(na >> 3) << 42) | ((uint64_t)tables[i].op_c << 45));
+            return;
+        }
+    }
+    (void)fail(l, "UPLOP3 table");
+}
+
 // SHFL (0x189): modes at 58-59 (idx, up, down, bfly); lane in Rb (0x589) or an immediate at 53-57; the
 // clamp/segment mask as an immediate at 40-52 or in Rc (0x989); predicate output 81-83.
 static void lower_shfl(L *l, const Insn *x, uint32_t op) {
@@ -2101,6 +2143,35 @@ static void lower_vote(L *l, const Insn *x) {
     if (x->w[1] || bits(x, 72, 2) > 2 || (x->w[2] & ~0x078e0300u)) return (void)fail(l, "VOTE mode");
     emit(l, 0x50d8000000000000ull | l->pred | rd | ((uint64_t)bits(x, 87, 4) << 39) | ((uint64_t)bits(x, 81, 3) << 45) |
                 ((uint64_t)bits(x, 72, 2) << 48));
+}
+
+// REDUX (0x3c4): a warp-wide reduction into a uniform register. .SUM (modulo 2^32) and unsigned .MAX over the active
+// lanes are the forms the level's shaders use, all unpredicated. Maxwell has no warp reduction, so this is the active
+// mask (a ballot) and one shuffle per lane: inactive lanes contribute zero, which changes no unsigned max and no sum.
+static void lower_redux(L *l, const Insn *x) {
+    uint32_t dest = bits(x, 16, 8), source = bits(x, 24, 8), mode = x->w[2] & ~0x200u;
+    int maximum = mode == 0x14000, sum = mode == 0xc000;
+    if (bits(x, 12, 4) != 7 || dest >= 63 || x->w[1] || bits(x, 73, 1) || (!maximum && !sum))
+        return (void)fail(l, "REDUX mode");
+    uint32_t target = ur_dst(l, dest);
+    if (target == RZ) return;   // the reduced value is never read
+    uint32_t mask = S(l, 0), v = S(l, 1), act = S(l, 2);
+    emit(l, 0x50d8000000000000ull | l->pred | mask | ((uint64_t)7 << 39) | ((uint64_t)7 << 45) | ((uint64_t)1 << 48));
+    mov_imm(l, target, 0);
+    for (uint32_t lane = 0; lane < 32; lane++) {
+        emit(l, l->pred | SHFL_IDX_R(v, source, lane));
+        emit(l, l->pred | SHR_IMM(act, mask, lane));
+        emit(l, l->pred | (uint64_t)(LOP32I | act | ((uint64_t)act << 8) | ((uint64_t)1 << 20)));   // act &= 1
+        emit(l, 0x5c10000000000000ull | l->pred | act | ((uint64_t)RZ << 8) | ((uint64_t)act << 20) |
+                    ((uint64_t)1 << 48));                                                            // act = -act
+        emit(l, 0x5be0000000000000ull | l->pred | v | ((uint64_t)v << 8) | ((uint64_t)act << 20) |
+                    ((uint64_t)0xc0 << 28) | ((uint64_t)RZ << 39) | ((uint64_t)7 << 48));            // v &= act
+        if (maximum)
+            emit(l, 0x5c20000000000000ull | l->pred | target | ((uint64_t)target << 8) | ((uint64_t)v << 20) |
+                        ((uint64_t)15 << 39));                                                       // max(U32)
+        else
+            emit(l, 0x5c10000000000000ull | l->pred | target | ((uint64_t)target << 8) | ((uint64_t)v << 20)); // sum
+    }
 }
 
 // FSWZADD (0x022): per-lane add/subtract pattern at 32-39; Maxwell's lane codes 1 and 2 are swapped.
@@ -2157,6 +2228,7 @@ static void lower_uniform_alu(L *l, const Insn *x, uint32_t op) {
         if (op == 0xc82) return mov_reg(l, ur(l, bits(x, 16, 8)), ur_in(l, bits(x, 32, 6), 5));
         return (void)fail(l, "UMOV form");
     case 0x085: plain = 0x017; has_c = 0; break;
+    case 0x09c: return lower_uplop3(l, x);
     case 0x090: plain = 0x010; break;
     case 0x091: plain = 0x011; break;
     case 0x092: plain = 0x012; break;
@@ -2459,8 +2531,9 @@ static void lower_imad_hi(L *l, const Insn *x) {
 
 // IABS (0x013): max(x, -x), signed.
 static void lower_iabs(L *l, const Insn *x) {
-    uint32_t rd = bits(x, 16, 8);
-    if (x->w[2] || bits(x, 24, 8)) return (void)fail(l, "IABS mode");
+    uint32_t rd = bits(x, 16, 8), form = bits(x, 9, 3);
+    int wide = form >= 2 && form <= 7;   // the immediate, constant-buffer and uniform source forms
+    if (x->w[2] || (!wide && bits(x, 24, 8))) return (void)fail(l, "IABS mode");
     Src b = srcn(l, x, 1, 0);
     uint32_t rb = to_reg(l, b, 1, 0, 0), t = S(l, 2);
     emit(l, base(l, 0x5c10000000000000ull, t, RZ) | ((uint64_t)rb << 20) | ((uint64_t)1 << 48));
@@ -2660,17 +2733,22 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0x98e: return lower_red(l, x);
     case 0x3a8: case 0x9a8: return lower_atomg(l, x, op);
     case 0x227: case 0x827: case 0xa27: return lower_imad_hi(l, x);
-    case 0x213: return lower_iabs(l, x);
+    case 0x213: case 0xa13: return lower_iabs(l, x);
     case 0x803: return lower_p2r_r2p(l, x, 0);
     case 0x804: return lower_p2r_r2p(l, x, 1);
     case 0x81c: return lower_plop3(l, x);
     case 0xf89: case 0x589: case 0x989: return lower_shfl(l, x, op);
     case 0x806: return lower_vote(l, x);
+    case 0x3c4: return lower_redux(l, x);
     case 0x822: return lower_fswzadd(l, x);
     case 0x3c2: return lower_r2ur(l, x);
     default:
         if (base_op >= 0x080 && base_op < 0x100) return lower_uniform_alu(l, x, op);
-        return (void)fail(l, "opcode");
+        {
+            char msg[32];
+            snprintf(msg, sizeof msg, "opcode %#x", base_op);
+            return (void)fail(l, msg);
+        }
     }
 }
 

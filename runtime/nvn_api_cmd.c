@@ -910,6 +910,25 @@ NVN_API(nvnCommandBufferPushComputeConstants) {
     r->size = n;
     memcpy(r->data, (const void *)(uintptr_t)data, n);
 }
+// NVN2: void nvnCommandBufferPushGraphicsConstants(NVNcommandBuffer *cmd, int stage, int offset, size_t bytes,
+// const void *data): the next draw's pushed constants, read as constant bank 0 of the stage. The level's graphics
+// shaders read their texture handles there; without it every such handle resolved to 0 (474 slots of a level frame).
+NVN_API(nvnCommandBufferPushGraphicsConstants) {
+    uint64_t stage = arg_x(c, 1), offset = arg_x(c, 2), n = arg_x(c, 3), data = arg_x(c, 4);
+    static volatile LONG said;
+    if (InterlockedIncrement(&said) <= 3)
+        rt_log("nvn: PushGraphicsConstants(%#llx, %#llx, %#llx bytes at %#llx)", (unsigned long long)stage,
+               (unsigned long long)offset, (unsigned long long)n, (unsigned long long)data);
+    if (n > 0x800 || offset > 0x800 - n || !data) {
+        rt_log("nvn: PushGraphicsConstants offset %#llx size %#llx data %#llx: dropped", (unsigned long long)offset,
+               (unsigned long long)n, (unsigned long long)data);
+        return;
+    }
+    p_update_ub *r = rec(cmd_of(c), OP_PUSH_GC, offsetof(p_update_ub, data) + n);
+    r->dst = offset;
+    r->size = n;
+    memcpy(r->data, (const void *)(uintptr_t)data, n);
+}
 NVN_API(nvnCommandBufferDispatchCompute) {
     *REC(cmd_of(c), OP_DISPATCH, p_dispatch) = (p_dispatch){(int)arg_x(c, 1), (int)arg_x(c, 2), (int)arg_x(c, 3), c->x[30]};
     bind_log("dispatch", 5, (int)arg_x(c, 1), (int)arg_x(c, 2), arg_x(c, 3), c->x[30]);
@@ -1114,7 +1133,7 @@ const char *nvn_op_name(uint32_t op) {
         "BIND_VSTREAM", "BIND_VBUF", "BIND_UBO", "BIND_SSBO", "BIND_TEX", "BIND_SAMP", "STENCIL", "POLY_OFFSET", "DRAW",
         "DRAW_IDX", "DISPATCH", "BARRIER", "SET_TEX_POOL", "SET_SAMP_POOL", "COPY_B2T", "COPY_STRIDE", "BLEND_COLOR",
         "COPY_T2B", "BIND_IMG", "COPY_T2T", "RESET_COUNTER", "CLEAR_TEX", "DEPTH_CLAMP", "RENDER_ENABLE",
-        "RASTER_DISCARD", "RENDER_COND", "PRIM_RESTART", "DRAW_IDX_IND", "DISPATCH_IND", "CLEAR_BUF", "COPY_IMG_STRIDE", "DRAW_IND", "XFB_BIND", "XFB_BEGIN", "XFB_END", "PUSH_CC",
+        "RASTER_DISCARD", "RENDER_COND", "PRIM_RESTART", "DRAW_IDX_IND", "DISPATCH_IND", "CLEAR_BUF", "COPY_IMG_STRIDE", "DRAW_IND", "XFB_BIND", "XFB_BEGIN", "XFB_END", "PUSH_CC", "PUSH_GC",
     };
     _Static_assert(sizeof names / sizeof *names == OP_COUNT_, "one name per op");
     return op < OP_COUNT_ ? names[op] : "?";

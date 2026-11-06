@@ -886,8 +886,14 @@ static void c0_table(uint8_t *at, const p_bind_buf b[16]) {
 // 0x610, the base instance at 0x644. Other stages: zeros. Unbound slots read zero, since the replay keeps them zero.
 // Layout: nxnative dm/gfx/nvn/nvn_mtl.m (MIT).
 void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16], const p_bind_buf ubo[16],
-                const uint32_t dispatch[3], uint32_t base_instance) {
+                const uint32_t dispatch[3], uint32_t base_instance, const uint8_t *push, uint32_t push_len) {
     memset(bank, 0, VK_C0_BYTES);
+    // NVN2's pushed graphics constants (OP_PUSH_GC) first: the game's shaders read their texture handles and buffer
+    // addresses there. The driver tables below win in their own ranges, for the translated shaders' fallback paths.
+    if (push && push_len && stage != NVN_STAGE_CS) {
+        uint32_t n = push_len < VK_C0_BYTES ? push_len : VK_C0_BYTES;
+        memcpy(bank, push, n);
+    }
     int base = stage == NVN_STAGE_VS ? 0x110 : stage == NVN_STAGE_FS ? 0x510 : stage == NVN_STAGE_CS ? 0x310 : -1;
     if (base < 0) return;
     c0_table(bank + base, ssbo);
@@ -982,12 +988,13 @@ static VkDescriptorBufferInfo c0_info(VkExec *ex, int st) {
     if (st == NVN_STAGE_CS) memcpy(in.ubo, ex->ubo[st], sizeof in.ubo), memcpy(in.dim, c0_dim, sizeof in.dim);
     else in.binst = c0_binst;
     int nvn2 = nvn2_cs(ex, st);   // its bank also depends on the push and the handles: compared by bytes below
-    if (!nvn2 && B.c0_valid[k] && !memcmp(&in, &B.c0_in[k], sizeof in))
+    int gcpush = !nvn2 && ex->push_gc_len;   // a pushed graphics bank changes per draw: never take the cached one
+    if (!nvn2 && !gcpush && B.c0_valid[k] && !memcmp(&in, &B.c0_in[k], sizeof in))
         return (VkDescriptorBufferInfo){B.c0_buf[k], B.c0_off[k], VK_C0_BYTES};
     B.c0_in[k] = in;
     uint8_t tmp[VK_C0_BYTES];
     if (nvn2) nvn2_c0_fill_cs(ex, tmp);
-    else vk_c0_fill(tmp, st, ex->ssbo[st], ex->ubo[st], c0_dim, c0_binst);
+    else vk_c0_fill(tmp, st, ex->ssbo[st], ex->ubo[st], c0_dim, c0_binst, ex->push_gc, ex->push_gc_len);
     if (!B.c0_valid[k] || memcmp(tmp, B.c0[k], VK_C0_BYTES)) {
         memcpy(scratch(ex, VK_C0_BYTES, &B.c0_buf[k], &B.c0_off[k]), tmp, VK_C0_BYTES);
         memcpy(B.c0[k], tmp, VK_C0_BYTES);
@@ -2835,6 +2842,25 @@ static void op_push_cc(VkExec *ex, const p_update_ub *u) {
     B.c0_valid[2] = 0;
 }
 
+// OP_PUSH_GC (NVN2 nvnCommandBufferPushGraphicsConstants): the next draw's pushed bytes, over the driver bank of its
+// graphics stage. The game's level shaders read their texture handles there (474 slots of a dumped level frame read
+// no handle before this). The first push of a sequence starts at its offset; later ones merge; the draw consumes it.
+static void op_push_gc(VkExec *ex, const p_update_ub *u) {
+    if (!u->size || u->dst + u->size > VK_C0_BYTES) return;
+    if (!ex->push_gc_len) memset(ex->push_gc, 0, sizeof ex->push_gc), ex->push_gc_lo = (uint32_t)u->dst;
+    memcpy(ex->push_gc + u->dst, u->data, u->size);
+    if (ex->push_gc_lo > u->dst) ex->push_gc_lo = (uint32_t)u->dst;
+    if (ex->push_gc_len < u->dst + u->size) ex->push_gc_len = (uint32_t)(u->dst + u->size);
+    B.c0_valid[0] = B.c0_valid[1] = 0;
+    static int logged;
+    if (logged < 4 && getenv("OOT_PUSH_GC_LOG")) {
+        logged++;
+        const uint32_t *q = (const uint32_t *)ex->push_gc;
+        rt_log("vk_exec: PushGraphicsConstants offset %#x size %#x: %08x %08x %08x %08x | +0x40: %08x %08x %08x %08x | +0x60: %08x %08x %08x %08x",
+               (unsigned)u->dst, (unsigned)u->size, q[0], q[1], q[2], q[3], q[16], q[17], q[18], q[19], q[24], q[25], q[26], q[27]);
+    }
+}
+
 static void op_update_ub(VkExec *ex, const p_update_ub *u) {
     if (!u->size) return;
     VkMemSpan sp;
@@ -3014,6 +3040,7 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     }
     case OP_UPDATE_UB: op_update_ub(ex, payload); break;
     case OP_PUSH_CC: op_push_cc(ex, payload); break;
+    case OP_PUSH_GC: op_push_gc(ex, payload); break;
     case OP_DRAW: op_draw(ex, payload); break;
     case OP_DRAW_IDX: op_draw_idx(ex, payload); break;
     case OP_DISPATCH: op_dispatch(ex, payload); ex->push_cc_len = 0; break;   // the push is consumed (NVN2)
