@@ -2596,28 +2596,32 @@ static void lower_txd(L *l, const Insn *x) {
 }
 
 // TLD (0xb66 bound, 0xf66 uniform handle): texel fetch at level zero (lod 87-89 = 1) or a level (3); 1D/2D/3D
-// and array 2D; x in Ra and y in Rb for 2D, (x, y) in Ra, Ra+1 and z in Rb for 3D, (layer, x) and y for arrays;
-// the level follows in the Rb list. Maxwell TLD takes the coordinates in Ra.. and the level in Rb (bit 55).
+// and array 2D; (x, y) in Ra, Ra+1 for 2D, (x, y) in Ra, Ra+1 and z in Rb for 3D, (layer, x) in Ra, Ra+1 and y in
+// Rb for arrays; the level follows in the Rb list (Rb for 2D and 1D, Rb+1 when the coordinates already use Rb).
+// Bit 76 is a packed 4-bit-per-component texel offset (.AOFFI, 2D): in Rb, or in Rb+1 after the level.
+// Maxwell TLD takes the coordinates in Ra.., the level in SrcB+1 (bit 55) and the offsets after it (bit 35).
 static void lower_tld(L *l, const Insn *x, uint32_t op) {
     uint32_t rd = bits(x, 16, 8), rd2 = bits(x, 64, 8), ra = bits(x, 24, 8), rb = bits(x, 32, 8);
     uint32_t mask = bits(x, 72, 4), dim = bits(x, 61, 3), tid = bits(x, 40, 14), bank = bits(x, 54, 5), lod = bits(x, 87, 3);
     int array = dim == 5, volume = dim == 2, level = lod == 3, bindless = op == 0xf66;
-    if (!bits(x, 60, 1) || (dim != 0 && dim != 1 && !array && !volume) || bits(x, 76, 5) || bits(x, 81, 3) != 7 ||
+    int offsets = bits(x, 76, 1);
+    if (!bits(x, 60, 1) || (dim != 0 && dim != 1 && !array && !volume) || (bits(x, 76, 5) & ~1u) || bits(x, 81, 3) != 7 ||
         (lod != 1 && !level) || bits(x, 59, 1) || mask == 0 || (bindless && (bits(x, 46, 13) || !bits(x, 91, 1))) ||
-        (!bindless && bank >= 18))
+        (!bindless && bank >= 18) ||
+        (offsets && (dim != 1 || rb == RZ || (level && (rb & 1 || rb >= 254)))))
         return (void)fail(l, "TLD mode");
-    uint32_t coords[3], n = 0, lev = RZ;
+    uint32_t coords[3], n = 0, lev = RZ, off = RZ;
     if (array || volume) coords[n++] = ra, coords[n++] = ra + 1, coords[n++] = rb;
-    else if (dim == 1) coords[n++] = ra, coords[n++] = rb;
+    else if (dim == 1) coords[n++] = ra, coords[n++] = ra + 1;
     else coords[n++] = ra;
-    if (level) lev = (array || volume || dim == 1) ? rb + 1 : rb;
-    if (level && dim == 0) lev = rb;
+    if (level) lev = (array || volume) ? rb + 1 : rb;
+    if (offsets) off = level ? rb + 1 : rb;
     int contiguous = coords[0] != RZ;
     for (uint32_t i = 1; i < n; i++) contiguous &= coords[i] == coords[0] + i;
     uint32_t c0 = coords[0];
     if (!contiguous) { for (uint32_t i = 0; i < n; i++) mov_reg(l, S(l, (int)i), coords[i]); c0 = S(l, 0); }
     int bound = !bindless && bank == 2;
-    uint32_t m0 = lev;
+    uint32_t m0 = (level || !offsets) ? lev : off;
     if (!bound) {
         if (bindless) to_reg_into(l, ur_src(l, bits(x, 40, 6)), S(l, 4));
         else {
@@ -2626,6 +2630,7 @@ static void lower_tld(L *l, const Insn *x, uint32_t op) {
             mov_cbuf(l, S(l, 4), &h);
         }
         if (level) mov_reg(l, S(l, 5), lev);
+        if (offsets) mov_reg(l, S(l, level ? 6 : 5), off);
         m0 = S(l, 4);
     }
     uint32_t components = (uint32_t)__builtin_popcount(mask);
@@ -2634,7 +2639,8 @@ static void lower_tld(L *l, const Insn *x, uint32_t op) {
     uint32_t target = direct ? rd : S(l, 0);
     uint32_t mdim = array ? 3 : volume ? 4 : dim == 1 ? 2 : 0;
     emit(l, (bound ? 0xdc00000000000000ull : 0xdd00000000000000ull) | l->pred | target | ((uint64_t)c0 << 8) | ((uint64_t)m0 << 20) |
-                ((uint64_t)mdim << 28) | ((uint64_t)mask << 31) | ((uint64_t)(bound ? tid : 0) << 36) | ((uint64_t)bits(x, 90, 1) << 49) |
+                ((uint64_t)mdim << 28) | ((uint64_t)mask << 31) | ((uint64_t)offsets << 35) |
+                ((uint64_t)(bound ? tid : 0) << 36) | ((uint64_t)bits(x, 90, 1) << 49) |
                 ((uint64_t)7 << 51) | ((uint64_t)level << 55));
     if (direct) return;
     for (uint32_t i = 0; i < components; i++) {
