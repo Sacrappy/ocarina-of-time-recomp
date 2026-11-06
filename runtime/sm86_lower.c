@@ -2140,6 +2140,31 @@ static void lower_p2r_r2p(L *l, const Insn *x, int r2p) {
     else emit(l, base(l, 0x38e8000000000000ull, rd, ra) | ((uint64_t)x->w[1] << 20) | ((uint64_t)bits(x, 76, 2) << 41));
 }
 
+// A PLOP3 table that is not (a op b) op c: read the predicate file into a register (P2R), form the index
+// a*4 + b*2 + c from the three predicate bits, shift the 8-bit table by it and write the one bit back (R2P). The
+// 4-bit operands carry a negate bit (3) and predicate 7 is PT. No PSETP form fits the level's rarer tables.
+static void plop3_lut_general(L *l, uint32_t a, uint32_t b, uint32_t c, uint32_t lut, uint32_t pd) {
+    uint32_t all = S(l, 0), idx = S(l, 1), bit = S(l, 2), val = S(l, 3);
+    emit(l, 0x38e8000000000000ull | l->pred | all | ((uint64_t)RZ << 8) | ((uint64_t)0x7f << 20));   // P2R all, RZ, 7f
+    mov_imm(l, idx, 0);
+    const uint32_t in[3] = {a, b, c};
+    for (int i = 0; i < 3; i++) {
+        uint32_t p = in[i] & 7, neg = in[i] >> 3;
+        if (p == 7) mov_imm(l, bit, neg ? 0 : 1);
+        else {
+            emit(l, l->pred | SHR_IMM(bit, all, p));
+            emit(l, l->pred | (uint64_t)(LOP32I | bit | ((uint64_t)bit << 8) | ((uint64_t)1 << 20)));   // bit &= 1
+            if (neg) emit(l, l->pred | (uint64_t)(LOP32I | bit | ((uint64_t)bit << 8) | ((uint64_t)1 << 20) | ((uint64_t)2 << 53)));
+        }
+        emit(l, l->pred | (uint64_t)(0x3848000000000000ull | idx | ((uint64_t)idx << 8) | ((uint64_t)1 << 20))); // idx <<= 1
+        emit(l, 0x5c10000000000000ull | l->pred | idx | ((uint64_t)idx << 8) | ((uint64_t)bit << 20));            // idx += bit
+    }
+    mov_imm(l, val, lut);
+    emit(l, 0x5c28000000000000ull | l->pred | val | ((uint64_t)val << 8) | ((uint64_t)idx << 20));   // val >>= idx
+    emit(l, l->pred | (uint64_t)(LOP32I | val | ((uint64_t)val << 8) | ((uint64_t)1 << 20)));        // val &= 1
+    emit(l, 0x38f0000000000000ull | l->pred | ((uint64_t)val << 8) | ((uint64_t)(1u << pd) << 20));  // R2P the bit
+}
+
 // PLOP3 (0x01c): Pd = LUT(Pa, Pb, Pc) with table bits 64-66 and 72-76, inputs at 87-90, 77-80, 68-71 (bit 3
 // negates), outputs 81-83 and 84-86; bit 67 makes the third a uniform predicate. Maxwell PSETP covers
 // (a op b) op2 c for and/or/xor; other tables are not lowered.
@@ -2173,7 +2198,7 @@ static void lower_plop3(L *l, const Insn *x) {
             return;
         }
     }
-    (void)fail(l, "PLOP3 table");
+    plop3_lut_general(l, a, b, c, lut, pd);
 }
 
 // UPLOP3 (0x89c): the same predicate LUT over uniform predicates; up() maps each UPn to the general predicate that
@@ -2206,7 +2231,7 @@ static void lower_uplop3(L *l, const Insn *x) {
             return;
         }
     }
-    (void)fail(l, "UPLOP3 table");
+    plop3_lut_general(l, a, b, c, lut, pd);
 }
 
 // SHFL (0x189): modes at 58-59 (idx, up, down, bfly); lane in Rb (0x589) or an immediate at 53-57; the
@@ -2733,15 +2758,14 @@ static void lower_one(L *l, const Insn *x) {
         // slot is the instruction's result, kept out of the merge and the restore (2026-11-06: the upscaler's
         // first layer ends its tile loop on PLOP3 P0 = UP0; restoring P0 made the loop run until its counters
         // wrapped, 2.2 s per dispatch and a GPU timeout in play); an input in one would read the uniform value.
-        uint32_t wr = 0, rd = 0, op = x->w[0] & 0xfff;
+        uint32_t wr = 0, op = x->w[0] & 0xfff;
         if (op == 0x81c) {
-            uint32_t pd = bits(x, 81, 3), pd2 = bits(x, 84, 3), a = bits(x, 87, 3), b = bits(x, 77, 3);
+            uint32_t pd = bits(x, 81, 3), pd2 = bits(x, 84, 3);
             if (pd != 7) wr |= 1u << pd;
             if (pd2 != 7) wr |= 1u << pd2;
-            if (a != 7) rd |= 1u << a;
-            if (b != 7) rd |= 1u << b;
-            if (!bits(x, 67, 1) && bits(x, 68, 3) != 7) rd |= 1u << bits(x, 68, 3);
-            if (rd & swap) return (void)fail(l, "PLOP3 reads the predicate a uniform one is swapped into");
+            // A PLOP3 input in a swapped slot reads the uniform predicate the swap just loaded there, which is what
+            // the instruction wants; an input that is also an output is overwritten after the read (keep excludes it).
+            // The old refusal left 27 level programs unlowered (2026-11-06).
         }
         uint32_t keep = swap & ~wr;
         if (!l->up_reg) {
