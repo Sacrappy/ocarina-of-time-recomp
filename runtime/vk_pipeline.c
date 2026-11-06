@@ -105,6 +105,8 @@ static struct {
     PFN_vkCmdSetAlphaToCoverageEnableEXT set_a2c;
     char cache_path[MAX_PATH * 2];
     VkPipeStats stats;
+    VkDescriptorSetLayout pool_layout;  // the bindless pool arrays' set layout (pool_layout()), NULL until needed
+    int pool_failed;                    // creating it failed: a pipeline with pool arrays does not build
 } P = {.lock = SRWLOCK_INIT};
 
 typedef struct Layout {
@@ -117,6 +119,9 @@ typedef struct Layout {
     VkDescriptorSetLayout set1;        // independent layouts: the fragment set (set 1); VK_NULL_HANDLE otherwise
     int push1;                         // set 1 is a push-descriptor set
     uint32_t n0;                       // independent layouts: b[0..n0) are set 0, the rest set 1
+    VkDescriptorSetLayout pool_set;    // the bindless pool arrays' set: set index pool_index; NULL: no pool arrays
+    uint32_t pool_index, pool_uses;    // its index in the pipeline layout; the GFX_POOL_* bindings the stages use
+    uint32_t n_sets;                   // sets in the pipeline layout: 1, 2 with independent layouts, +1 with pool arrays
     VkPipelineLayout half[2];          // GPL libraries: {set 0, null}, {null, set 1} (made on first use)
     VkDescriptorUpdateTemplate tpl[2]; // per set (make_tpl); VK_NULL_HANDLE: written with write structs
     VkDescriptorSetLayoutBinding b[];
@@ -626,17 +631,69 @@ int vk_pipeline_set_indep(int on) {
 
 // ---- SPIR-V rewrites
 
-// Binding decorations b >= 1 become b + off (the fragment stage's share of set 0).
-static uint32_t *spirv_rebind(const uint32_t *w, uint64_t n, uint32_t off) {
+// Binding decorations b >= 1 become b + off (the fragment stage's share of set 0). A bindless pool array of that stage
+// keeps its number: it moves to the pool set instead (spirv_pool).
+static uint32_t pool_binding_of(const GfxShader *st, uint32_t binding) {
+    const GfxShaderRes *r;
+    int n = st ? gfx_shader_resources(st, GFX_RES_TEX, &r) : 0;
+    for (int i = 0; i < n; i++)
+        if (r[i].pool_array && r[i].binding == binding) return 1;
+    return 0;
+}
+
+static uint32_t *spirv_rebind(const uint32_t *w, uint64_t n, uint32_t off, const GfxShader *st) {
     uint32_t *o = malloc(n * 4);
     if (!o) return NULL;
     memcpy(o, w, n * 4);
     for (uint64_t i = 5; i < n;) {
         uint32_t op = o[i] & 0xffff, len = o[i] >> 16;
         if (!len || i + len > n) break;
-        if (op == SPV_OP_DECORATE && len >= 4 && o[i + 2] == SPV_DEC_BINDING && o[i + 3] >= 1) o[i + 3] += off;
+        if (op == SPV_OP_DECORATE && len >= 4 && o[i + 2] == SPV_DEC_BINDING && o[i + 3] >= 1 &&
+            !pool_binding_of(st, o[i + 3]))
+            o[i + 3] += off;
         i += len;
     }
+    return o;
+}
+
+// A stage's bindless pool arrays move to the pool set: DescriptorSet becomes set, Binding becomes the array's
+// GFX_POOL_* binding (gfx.h), where every element is pool id k of the bound NVN pool (vk_exec_draw.c pool_set).
+static uint32_t *spirv_pool(const uint32_t *w, uint64_t n, uint32_t set, const GfxShader *st, uint32_t *uses) {
+    const GfxShaderRes *r;
+    int nr = gfx_shader_resources(st, GFX_RES_TEX, &r);
+    uint32_t *o = malloc(n * 4), from[MAX_BINDINGS], to[MAX_BINDINGS], nu = 0, mask = 0;
+    if (!o) return NULL;
+    for (int i = 0; i < nr; i++) {
+        if (!r[i].pool_array) continue;
+        int canon = gfx_pool_is_sampler(&r[i]) ? GFX_POOL_SAMP : gfx_pool_binding(r[i].type);
+        if (canon < 0 || nu == MAX_BINDINGS) continue;
+        from[nu] = r[i].binding, to[nu] = (uint32_t)canon, nu++;
+        mask |= 1u << canon;
+    }
+    memcpy(o, w, n * 4);
+    // One pass over the annotations: a pool array's Binding becomes its GFX_POOL_* binding, and the same variable's
+    // DescriptorSet becomes the pool set. Every decoration is visited once with its original value, so a rewritten
+    // number cannot be matched again.
+    for (uint64_t i = 5; i < n && nu;) {
+        uint32_t op = o[i] & 0xffff, len = o[i] >> 16;
+        if (!len || i + len > n) break;
+        if (op == SPV_OP_DECORATE && len >= 4 && o[i + 2] == SPV_DEC_BINDING)
+            for (uint32_t k = 0; k < nu; k++)
+                if (o[i + 3] == from[k]) {
+                    uint32_t var = o[i + 1];
+                    o[i + 3] = to[k];
+                    for (uint64_t j = 5; j < n;) {   // the same variable's DescriptorSet
+                        uint32_t op2 = o[j] & 0xffff, len2 = o[j] >> 16;
+                        if (!len2 || j + len2 > n) break;
+                        if (op2 == SPV_OP_DECORATE && len2 >= 4 && o[j + 1] == var && o[j + 2] == SPV_DEC_DESCRIPTOR_SET)
+                            o[j + 3] = set;
+                        j += len2;
+                    }
+                    break;
+                }
+        i += len;
+    }
+    if (uses) *uses = mask;
     return o;
 }
 
@@ -1075,6 +1132,10 @@ typedef struct {
     uint32_t n;
     VkDescriptorSetLayoutBinding b[MAX_BINDINGS];
     VkPipeBinding pb[MAX_BINDINGS];
+    uint32_t pool_n;                   // bindless pool arrays: they live in their own set, not in b[]/pb[]
+    uint16_t pool_binding[MAX_BINDINGS];   // the binding the module decorates the array with (unshifted)
+    uint8_t pool_canon[MAX_BINDINGS];      // its GFX_POOL_* binding in the pool set
+    uint32_t pool_uses;                    // those canonical bindings, as a mask
 } Bindings;
 
 static VkDescriptorType descriptor_type(int kind, const GfxShaderRes *r) {
@@ -1084,7 +1145,6 @@ static VkDescriptorType descriptor_type(int kind, const GfxShaderRes *r) {
     case GFX_RES_SSBO: return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     case GFX_RES_TEX:
         if (buffer) return VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
-        if (r->type == 0) return VK_DESCRIPTOR_TYPE_SAMPLER;   // Ryujinx's bindless sampler array
         if (r->separate) LOG_ONCE("vk_pipeline: a separate texture handle: bound as SAMPLED_IMAGE");
         return r->separate ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     default: return buffer ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -1096,19 +1156,23 @@ static VkShaderStageFlags stage_bit(int stage) {
                                                                                       : VK_SHADER_STAGE_COMPUTE_BIT;
 }
 
-// One past the highest binding a shader uses (1 with no resources: binding 0 is the support buffer).
+// One past the highest binding a shader uses (1 with no resources: binding 0 is the support buffer). Bindless pool
+// arrays are left out: they live in their own set (spirv_pool), whatever number the module gave them.
 static uint32_t binding_span(const GfxShader *s) {
     uint32_t span = 1;
     for (int k = 0; k < GFX_RES_KINDS; k++) {
         const GfxShaderRes *r;
         int n = gfx_shader_resources(s, k, &r);
         for (int i = 0; i < n; i++)
-            if (r[i].binding + (uint32_t)(r[i].count ? r[i].count : 1) > span) span = r[i].binding + (r[i].count ? r[i].count : 1);
+            if (!r[i].pool_array && r[i].binding + (uint32_t)(r[i].count ? r[i].count : 1) > span)
+                span = r[i].binding + (uint32_t)(r[i].count ? r[i].count : 1);
     }
     return span;
 }
 
-// Adds a stage's resources with bindings b >= 1 moved by off; binding 0 (support buffer) is shared.
+// Adds a stage's resources with bindings b >= 1 moved by off; binding 0 (support buffer) is shared. A bindless pool
+// array (gfx.h GFX_POOL_*) is not a binding of that set: it is recorded for the pool set (spirv_pool rewrites its
+// Set/Binding decorations) and leaves the stage's binding numbers alone.
 static int add_stage(Bindings *B, const GfxShader *s, uint32_t off) {
     int stage = gfx_shader_stage(s);
     VkShaderStageFlags bit = stage_bit(stage);
@@ -1123,6 +1187,19 @@ static int add_stage(Bindings *B, const GfxShader *s, uint32_t off) {
         const GfxShaderRes *r;
         int n = gfx_shader_resources(s, k, &r);
         for (int i = 0; i < n; i++) {
+            if (r[i].pool_array && k == GFX_RES_TEX) {
+                int canon = gfx_pool_is_sampler(&r[i]) ? GFX_POOL_SAMP : gfx_pool_binding(r[i].type);
+                if (canon < 0) {
+                    LOG_ONCE("vk_pipeline: a bindless pool array of sampler type %#x has no binding: its draws keep the placeholder", r[i].type);
+                    continue;
+                }
+                if (B->pool_n == MAX_BINDINGS) return 0;
+                B->pool_binding[B->pool_n] = r[i].binding;
+                B->pool_canon[B->pool_n] = (uint8_t)canon;
+                B->pool_uses |= 1u << canon;
+                B->pool_n++;
+                continue;
+            }
             if (B->n == MAX_BINDINGS || !r[i].binding) return 0;
             VkDescriptorType t = descriptor_type(k, &r[i]);
             uint32_t binding = r[i].binding + off, count = r[i].count ? r[i].count : 1;
@@ -1160,6 +1237,7 @@ static int module_binding_missing(const GfxShader *s, const VkDescriptorSetLayou
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
         if (!len || i + len > words) break;
         if (op == SPV_OP_DECORATE && len >= 4 && w[i + 2] == SPV_DEC_BINDING && w[i + 1] < bound && ref[w[i + 1]] == 3) {
+            if (pool_binding_of(s, w[i + 3])) { i += len; continue; }   // in the pool set, not this one
             uint32_t want = w[i + 3] + (w[i + 3] >= 1 ? off : 0), j = 0;
             while (j < n && b[j].binding != want) j++;
             if (j == n) missing = (int)w[i + 3];
@@ -1236,16 +1314,64 @@ static int64_t bindings_sort(Bindings *B, uint64_t *h) {
     return total;
 }
 
+// The bindless pool arrays' descriptor set layout (gfx.h GFX_POOL_*): one binding per kind of pool array, every element
+// indexed by NVN pool id. UPDATE_AFTER_BIND because the replay writes into the set while earlier submissions may still
+// read it (vk_exec_draw.c pool_set), PARTIALLY_BOUND because only the ids the pool registered are written: an id past
+// the pool reads an empty descriptor, never another texture. Shared by every pipeline that has pool arrays, so one set
+// serves them all. Caller holds P.lock.
+static VkDescriptorSetLayout pool_layout(void) {
+    if (P.pool_layout || P.pool_failed) return P.pool_layout;
+    if (!vk_ctx()->has_pool_arrays) {
+        P.pool_failed = 1;
+        LOG_ONCE("vk_pipeline: no descriptor indexing on this GPU: the bindless pool arrays keep the placeholder");
+        return NULL;
+    }
+    VkDescriptorSetLayoutBinding b[GFX_POOL_KINDS];
+    VkDescriptorBindingFlags f[GFX_POOL_KINDS];
+    for (int i = 0; i < GFX_POOL_KINDS; i++) {
+        int samp = i == GFX_POOL_SAMP;
+        b[i] = (VkDescriptorSetLayoutBinding){(uint32_t)i, samp ? VK_DESCRIPTOR_TYPE_SAMPLER : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                                              samp ? GFX_POOL_SAMP_SLOTS : GFX_POOL_TEX_SLOTS,
+                                              VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+                                              NULL};
+        f[i] = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+    }
+    VkDescriptorSetLayoutBindingFlagsCreateInfo bf = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
+                                                      .bindingCount = GFX_POOL_KINDS, .pBindingFlags = f};
+    VkDescriptorSetLayoutCreateInfo si = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                          .pNext = &bf, .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT,
+                                          .bindingCount = GFX_POOL_KINDS, .pBindings = b};
+    if (vkCreateDescriptorSetLayout(P.device, &si, NULL, &P.pool_layout) != VK_SUCCESS) {
+        P.pool_layout = VK_NULL_HANDLE, P.pool_failed = 1;
+        LOG_ONCE("vk_pipeline: the bindless pool set layout could not be created: those draws keep the placeholder");
+        return NULL;
+    }
+    rt_log("vk_pipeline: bindless pool set: %d bindings, %d texture slots and %d sampler slots each, update after bind", GFX_POOL_KINDS,
+           GFX_POOL_TEX_SLOTS, GFX_POOL_SAMP_SLOTS);
+    return P.pool_layout;
+}
+
 static Layout *layout_get(Bindings *B) {
     uint64_t h = FNV0;
     int64_t total = bindings_sort(B, &h);
     if (total < 0) return NULL;
+    uint32_t uses = B->pool_n ? B->pool_uses : 0;
+    h = fnv(h, &uses, sizeof uses);   // a pool set changes the pipeline layout, not the binding list
     Layout **head = &layouts[h % LAYOUT_BUCKETS];
     for (Layout *l = *head; l; l = l->next)
-        if (l->hash == h && l->n == B->n && !memcmp(l->b, B->b, B->n * sizeof *B->b)) return l;
+        if (l->hash == h && l->n == B->n && l->pool_uses == uses && !memcmp(l->b, B->b, B->n * sizeof *B->b)) return l;
     Layout *l = calloc(1, sizeof *l + B->n * sizeof *B->b);
     if (!l) return NULL;
     l->hash = h, l->n = B->n;
+    if (uses) {
+        if (!(l->pool_set = pool_layout())) {
+            free(l);
+            return NULL;
+        }
+        l->pool_index = 1, l->pool_uses = uses, l->n_sets = 2;
+    } else {
+        l->n_sets = 1;
+    }
     memcpy(l->b, B->b, B->n * sizeof *B->b);
     l->push = total <= (int64_t)P.max_push;
     VkDescriptorSetLayoutCreateInfo si = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -1255,8 +1381,9 @@ static Layout *layout_get(Bindings *B) {
         free(l);
         return NULL;
     }
-    VkPipelineLayoutCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
-                                     .pSetLayouts = &l->set};
+    VkDescriptorSetLayout sets[2] = {l->set, l->pool_set};
+    VkPipelineLayoutCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = l->n_sets,
+                                     .pSetLayouts = sets};
     if (vkCreatePipelineLayout(P.device, &pi, NULL, &l->layout) != VK_SUCCESS) {
         vkDestroyDescriptorSetLayout(P.device, l->set, NULL);
         free(l);
@@ -1282,16 +1409,29 @@ static Layout *layout_pair(Bindings *B, Bindings *F) {
     int64_t tf = bindings_sort(F, &h);
     if (tv < 0 || tf < 0 || B->n + F->n > MAX_BINDINGS) return NULL;
     uint32_t n0 = B->n, n = B->n + F->n;
+    uint32_t uses = B->pool_uses | F->pool_uses;
+    h = fnv(h, &uses, sizeof uses);   // the pool set changes the pipeline layout, not the binding lists
     memcpy(B->b + n0, F->b, F->n * sizeof *F->b);
     memcpy(B->pb + n0, F->pb, F->n * sizeof *F->pb);
     for (uint32_t i = n0; i < n; i++) B->pb[i].set = 1;
     B->n = n;
+    B->pool_uses = uses;
     Layout **head = &layouts[h % LAYOUT_BUCKETS];
     for (Layout *l = *head; l; l = l->next)
-        if (l->hash == h && l->set1 && l->n == n && l->n0 == n0 && !memcmp(l->b, B->b, n * sizeof *B->b)) return l;
+        if (l->hash == h && l->set1 && l->n == n && l->n0 == n0 && l->pool_uses == uses &&
+            !memcmp(l->b, B->b, n * sizeof *B->b)) return l;
     Layout *l = calloc(1, sizeof *l + n * sizeof *B->b);
     if (!l) return NULL;
     l->hash = h, l->n = n, l->n0 = n0;
+    if (uses) {
+        if (!(l->pool_set = pool_layout())) {
+            free(l);
+            return NULL;
+        }
+        l->pool_index = 2, l->pool_uses = uses, l->n_sets = 3;
+    } else {
+        l->n_sets = 2;
+    }
     memcpy(l->b, B->b, n * sizeof *B->b);
     l->push = P.push_stage == GFX_STAGE_VS && tv <= (int64_t)P.max_push;
     l->push1 = P.push_stage == GFX_STAGE_FS && F->n && tf <= (int64_t)P.max_push;
@@ -1310,9 +1450,9 @@ static Layout *layout_pair(Bindings *B, Bindings *F) {
         free(l);
         return NULL;
     }
-    VkDescriptorSetLayout sets[2] = {l->set, l->set1};
+    VkDescriptorSetLayout sets[3] = {l->set, l->set1, l->pool_set};
     VkPipelineLayoutCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-                                     .flags = VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT, .setLayoutCount = 2,
+                                     .flags = VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT, .setLayoutCount = l->n_sets,
                                      .pSetLayouts = sets};
     if (vkCreatePipelineLayout(P.device, &pi, NULL, &l->layout) != VK_SUCCESS) {
         vkDestroyDescriptorSetLayout(P.device, l->set, NULL);
@@ -1394,6 +1534,9 @@ static Pipe *pipe_add(const void *key, size_t size, uint64_t h, VkPipeline pipel
     p->info.set_layout1 = l ? l->set1 : VK_NULL_HANDLE;
     p->info.push1 = l ? l->push1 : 0;
     p->info.n_sets = l && l->set1 ? 2 : 1;
+    p->info.pool_set = l ? l->pool_set : VK_NULL_HANDLE;
+    p->info.pool_index = l ? l->pool_index : 0;
+    p->info.pool_uses = l ? l->pool_uses : 0;
     if (l) p->info.tpl[0] = l->tpl[0], p->info.tpl[1] = l->tpl[1];
     p->lay = l;
     Pipe **head = &pipes[h % PIPE_BUCKETS];
@@ -1565,10 +1708,16 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
             if (d) fcode = fpatched = d, fw = n2;
             else LOG_ONCE("vk_pipeline: SRC1 blend factors but the fragment shader writes no colour output 1");
         }
-        if (l->set1 || fs_off) {
-            uint32_t *r = !fcode ? NULL : l->set1 ? spirv_set(fcode, fw, 1) : spirv_rebind(fcode, fw, fs_off);
+        if (l->set1 || fs_off || l->pool_set) {
+            uint32_t *r = !fcode ? NULL : l->set1 ? spirv_set(fcode, fw, 1)
+                                                : (fs_off ? spirv_rebind(fcode, fw, fs_off, s->fs) : NULL);
             free(fpatched);
             fcode = fpatched = r;
+            if (fcode && l->pool_set) {   // the bindless pool arrays move to the pool set
+                uint32_t *q = spirv_pool(fcode, fw, l->pool_index, s->fs, NULL);
+                free(fpatched);
+                fcode = fpatched = q;
+            }
         }
         // A bound colour target outside the shader's output map gets write mask 0 (target_wmask)
         if (fcode) fm = make_module(fcode, fw);
@@ -1585,6 +1734,15 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
             snprintf(path, sizeof path, "%s/xfb_vs_%02d.spv", vk_dump_dir(), nx++);
             FILE *f = fopen(path, "wb");
             if (f) fwrite(vcode, 4, (size_t)vw, f), fclose(f);
+        }
+    }
+    if (l->pool_set) {   // the vertex stage's bindless pool arrays move to the pool set too
+        uint32_t *q = spirv_pool(vcode, vw, l->pool_index, s->vs, NULL);
+        if (q) {
+            free(vpatched);   // the same copy vcode may point at
+            vpatched = q, vcode = q;
+        } else {
+            LOG_ONCE("vk_pipeline: cannot move the vertex stage's pool arrays into the pool set");
         }
     }
     vm = make_module(vcode, vw);
@@ -1708,9 +1866,9 @@ static double ms_since(uint64_t t0) {
 
 static VkPipelineLayout half_layout(Layout *l, int h) {
     if (l->half[h]) return l->half[h];
-    VkDescriptorSetLayout sets[2] = {h ? VK_NULL_HANDLE : l->set, h ? l->set1 : VK_NULL_HANDLE};
+    VkDescriptorSetLayout sets[3] = {h ? VK_NULL_HANDLE : l->set, h ? l->set1 : VK_NULL_HANDLE, l->pool_set};
     VkPipelineLayoutCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-                                     .flags = VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT, .setLayoutCount = 2,
+                                     .flags = VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT, .setLayoutCount = l->n_sets,
                                      .pSetLayouts = sets};
     if (vkCreatePipelineLayout(P.device, &pi, NULL, &l->half[h]) != VK_SUCCESS) l->half[h] = VK_NULL_HANDLE;
     return l->half[h];
@@ -2762,14 +2920,20 @@ static void prebuild_start(void) {
 static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
     uint64_t words;
     const uint32_t *code = gfx_shader_spirv(cs, &words);
+    uint32_t *pooled = l->pool_set ? spirv_pool(code, words, l->pool_index, cs, NULL) : NULL;
+    if (pooled) code = pooled;
     VkShaderModule m = make_module(code, words);
-    if (!m) return VK_NULL_HANDLE;
+    if (!m) {
+        free(pooled);
+        return VK_NULL_HANDLE;
+    }
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rqc;
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                                       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                                                 .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"},
                                       .layout = l->layout};
     pin_subgroup32(&ci.stage, &rqc, code, words);
+    free(pooled);
     VkPipeline pipe = VK_NULL_HANDLE;
     double t0 = now_ms();
     if (vkCreateComputePipelines(P.device, P.cache, 1, &ci, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
@@ -3372,6 +3536,9 @@ void vk_pipeline_shutdown(void) {
         }
         layouts[i] = NULL;
     }
+    if (P.pool_layout) vkDestroyDescriptorSetLayout(P.device, P.pool_layout, NULL);
+    P.pool_layout = VK_NULL_HANDLE;
+    P.pool_failed = 0;
     AcquireSRWLockExclusive(&save_lock);   // not while the autosave thread copies it
     if (P.cache) vkDestroyPipelineCache(P.device, P.cache, NULL);
     P.cache = VK_NULL_HANDLE;

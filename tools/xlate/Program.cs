@@ -28,6 +28,13 @@ using System.Text.Json.Nodes;
 static class SwshXlate
 {
     const int TexBase = 0x168, SampBase = 0x568;   // NVN 分离贴图 / 采样器句柄在 c[2] 的字节基址（每槽 8 字节；dm/gfx/tools/maxwell_refs.py 全量实测） | byte base of NVN separate texture / sampler handles in c[2] (8 bytes per slot; full measurement in dm/gfx/tools/maxwell_refs.py)
+    // 纹理池/采样器池数组的长度，默认值取实测的池大小（runtime/gfx.h GFX_POOL_TEX_SLOTS / GFX_POOL_SAMP_SLOTS，日志里
+    // `nvn: TexturePool n=33068` / `SamplerPool n=4096`）。小于它时数组会被截断（下标被钳到 length - 1），
+    // 大于池大小时多出的元素主机从不写，读到空描述符 | The pool array lengths, defaulting to the measured pool
+    // sizes (runtime/gfx.h GFX_POOL_TEX_SLOTS / GFX_POOL_SAMP_SLOTS; the log has `nvn: TexturePool n=33068` and
+    // `SamplerPool n=4096`). Shorter truncates the pool (the index is clamped to length - 1); longer leaves elements the
+    // host never writes, which read as empty descriptors.
+    const int DefaultTexturePoolLength = 33068, DefaultSamplerPoolLength = 4096, MinPoolArrayLength = 1024;
 
     sealed class Accessor : IGpuAccessor
     {
@@ -40,11 +47,13 @@ static class SwshXlate
         // 全部资源放进第 0 组，各占不同绑定号（spirv-cross 出成一个参数缓冲）；常量段号 index 的缓冲由翻译器给 binding = index+1 的惯例不依赖
         // All resources go into set 0, each with a distinct binding number (spirv-cross emits them as one argument buffer); the translator's convention of giving the buffer of constant segment number index binding = index+1 is not relied on
         public SetBindingPair CreateConstantBufferBinding(int index) => new(0, _binding++);
-        public SetBindingPair CreateImageBinding(int count, bool isBuffer) { int b = _binding; _binding += count; return new(0, b); }
+        public SetBindingPair CreateImageBinding(int count, bool isBuffer) { int b = _binding; _binding += PoolArrayCount(count, isBuffer) ? 1 : count; return new(0, b); }
         public SetBindingPair CreateStorageBufferBinding(int index) => new(0, _binding++);
-        public SetBindingPair CreateTextureBinding(int count, bool isBuffer) { int b = _binding; _binding += count; return new(0, b); }
+        public SetBindingPair CreateTextureBinding(int count, bool isBuffer) { int b = _binding; _binding += PoolArrayCount(count, isBuffer) ? 1 : count; return new(0, b); }
         public ReadOnlySpan<ulong> GetCode(ulong address, int minimumSize) => MemoryMarshal.Cast<byte, ulong>(new ReadOnlySpan<byte>(_code)[(int)address..]);
-        public int QuerySamplerArrayLengthFromPool() => 32;
+        // 纹理池/采样器池数组（bindless）占一个绑定号，不占数组长度那么多个：否则其后的每个绑定号都被推到 32000 以上 | A bindless pool array takes one binding number, not one per element: its length is the pool size, which would push every later binding past 32000. The host moves these arrays into a set of their own anyway (runtime/vk_pipeline.c pool_layout), so the number only has to be unique within the shader.
+        bool PoolArrayCount(int count, bool isBuffer) => !isBuffer && count >= MinPoolArrayLength;
+        public int QuerySamplerArrayLengthFromPool() => _job["spool"] is JsonNode n ? (int)n : DefaultSamplerPoolLength;
         // Texture arrays whose handles a user uniform block holds: element k is the handle at byte 8 k of the block
         // (Ryujinx sizes them by the bound block, size / 8; this offline translator cannot see it). Uniform block 3
         // (NVN slot 0) of this game's fog and light-list passes holds up to 32 records of 144 bytes, each with a
@@ -53,7 +62,17 @@ static class SwshXlate
         // The other blocks' arrays (about 4900 shaders, material tables) stay at 32: each element is a descriptor
         // written at every draw.
         public int QueryTextureArrayLengthFromBuffer(int slot) => slot == 3 ? 1024 : 32;
-        public int QueryTextureArrayLengthFromPool() => 32;
+        // 纹理池数组的长度：实测的 NVN 纹理池大小（runtime/gfx.h GFX_POOL_TEX_SLOTS）；翻译器把它当成
+        // min(handle & 0xfffff, length - 1) 的上界。作业字段 "tpool" 可覆盖，如同其他主机答复 |
+        // The texture pool array's length: the measured NVN texture pool size (runtime/gfx.h GFX_POOL_TEX_SLOTS), which
+        // bounds min(handle & 0xfffff, length - 1). The job field "tpool" overrides it, as the other host answers do.
+        public int QueryTextureArrayLengthFromPool() => _job["tpool"] is JsonNode n ? (int)n : DefaultTexturePoolLength;
+        // 非一致索引：纹理池和采样器池的下标来自数据（同一 subgroup 里可以不同），主机开了
+        // shaderSampledImageArrayNonUniformIndexing，访问须带 NonUniform 装饰 | Non-uniform indexing: the pool
+        // index comes from data, so it can differ across a subgroup. The host enables
+        // shaderSampledImageArrayNonUniformIndexing, so the accesses carry Ryujinx's NonUniform decoration
+        // (Instructions.cs MarkNonUniform).
+        public bool QueryHostSupportsShaderNonUniformIndexing() => true;
 
         string Get(string table, int slot) => _job[table] is JsonObject t && t[slot.ToString()] is JsonNode n ? (n is JsonObject o ? (string)o["type"] : (string)n) : null;
         // 槽号 | the host's c2 slot of a handle (gfx_shader.c handle_slot): combined texture+sampler handles at bytes
