@@ -2253,7 +2253,23 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         if (vs_wait) vs = shader_for(ex, NVN_STAGE_VS, &has_vs, NULL, 1);
         if (fs_wait) fs = shader_for(ex, NVN_STAGE_FS, &has_fs, NULL, 1);
     }
-    if (!vs || (has_fs && !fs)) return 0;
+    if (!vs || (has_fs && !fs)) {
+        if (vk_dump_armed) {   // which program the draw needed, by the code hash tools/kernel.py prints
+            char hv[2][17] = {"-", "-"};
+            for (int k = 0; k < 2; k++) {
+                const uint8_t *ctl, *code;
+                uint32_t len;
+                if (!ex->prog || !vk_exec_find_stage(ex->prog, k ? NVN_STAGE_FS : NVN_STAGE_VS, &ctl, &code, &len)) continue;
+                uint64_t h = 0xcbf29ce484222325ull;
+                for (uint32_t i = 0; i < len; i++) h = (h ^ code[i]) * 0x100000001b3ull;
+                snprintf(hv[k], sizeof hv[k], "%016llx", (unsigned long long)h);
+            }
+            vk_dump_note("draw of %u vertices skipped: no %s shader (vs code %s%s, fs code %s%s), pass %ux%u", count,
+                         !vs ? "vertex" : "fragment", hv[0], vs ? " ok" : " missing", hv[1], fs ? " ok" : has_fs ? " missing" : "",
+                         ex->pass_w, ex->pass_h);
+        }
+        return 0;
+    }
     uint32_t fbl = feedback_prepare(ex, fs);
     VkPipeState s = ex->pipe;
     s.vs = vs, s.fs = fs;
@@ -2724,7 +2740,16 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     dummies_init();
     int present;
     const GfxShader *cs = shader_for(ex, NVN_STAGE_CS, &present, NULL, 0);   // synchronous: a skipped dispatch changes results
-    if (!cs) return;
+    if (!cs) {
+        const uint8_t *ctl, *code;
+        uint32_t len;
+        if (vk_dump_armed && ex->prog && vk_exec_find_stage(ex->prog, NVN_STAGE_CS, &ctl, &code, &len)) {
+            uint64_t h = 0xcbf29ce484222325ull;
+            for (uint32_t i = 0; i < len; i++) h = (h ^ code[i]) * 0x100000001b3ull;
+            vk_dump_note("dispatch %dx%dx%d skipped: no compute shader (code %016llx)", d->x, d->y, d->z, (unsigned long long)h);
+        }
+        return;
+    }
     if (skip_cs(cs)) return;
     cs_log(ex, cs, d, "dispatch");
     const VkPipeInfo *info = NULL;

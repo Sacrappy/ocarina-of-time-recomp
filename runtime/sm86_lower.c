@@ -430,7 +430,7 @@ static void insn_regs(const Insn *x, uint64_t use[4], uint64_t def[4]) {
     int predicated = g != 7;
     if (g == 15) return;
     if (uniform_op(op)) {
-        if (op == 0x3c2) set_run(use, f24, 1);                     // R2UR reads a general register
+        if (op == 0x3c2 || op == 0x3c4) set_run(use, f24, 1);      // R2UR, REDUX read a general register
         return;
     }
     if (base >= 0x140 && base < 0x160) {
@@ -447,7 +447,7 @@ static void insn_regs(const Insn *x, uint64_t use[4], uint64_t def[4]) {
     int store = base == 0x186 || base == 0x187 || base == 0x188 || base == 0x122 || base == 0x18e || base == 0x127 ||
                 base == 0x19b || base == 0x19c || base == 0x19e;
     int no_dst = store || base == 0x118 || base == 0x11a || base == 0x192 || base == 0x11d || base == 0x004 || base == 0x01c ||
-                 (base == 0x00b) || (base == 0x00c);
+                 (base == 0x00b) || (base == 0x00c) || (base == 0x034);   // FSETP, ISETP, HSETP2: predicates only
     // The destination's width: loads by their size (73-75: 6 = 128 bits, 5 = 64), texture ops by their mask (the
     // first two components to Rd, the rest to the second destination at 64-71 when given), IMAD.WIDE and a 64-bit
     // CS2R two registers; else one. Over-stating a write is unsafe (it frees a live register), so packed-half
@@ -489,6 +489,13 @@ static void insn_regs(const Insn *x, uint64_t use[4], uint64_t def[4]) {
         static const uint8_t coords[8] = {1, 1, 2, 2, 3, 3, 1, 1};
         set_run(use, f24, coords[bits(x, 61, 3)]);
         set_run(use, f32 & 0x3f, (uint32_t)__builtin_popcount(bits(x, 72, 4)));
+    }
+    if (base == 0x197) {                                          // SULD: coordinates by the dimension, a result by mask
+        static const uint8_t coords[8] = {1, 1, 2, 2, 3, 3, 1, 1};
+        uint32_t n = (uint32_t)__builtin_popcount(bits(x, 72, 4));
+        set_run(use, f24, coords[bits(x, 61, 3)]);
+        if (!predicated) set_run(def, f16, n ? n : 1);
+        else set_run(use, f16, n ? n : 1);
     }
 }
 
@@ -1565,6 +1572,23 @@ static void lower_sust(L *l, const Insn *x) {
                 ((uint64_t)hr << 39));
 }
 
+// SULD.P (0xb97, 2026-11-06: the level's compute kernels, 23 of them refused for it): SUST.P's layout for the
+// handle (dword index 40-53, bank 54-58), coordinates (24-31) and dimension (61-63), the destination at 16-23 (one
+// register per channel of the mask at 72-75), a predicate result at 81-83 (PT throughout the corpus) and 1 at
+// 84-86 in every one seen. Maxwell SULD.P.B (bindless, Ryujinx InstSuldB): dest 0-7, coordinates 8-15, channel
+// mask 20-23, the predicate result 30-32 (PT: none), dimension 33-35, handle register 39-46.
+static void lower_suld(L *l, const Insn *x) {
+    uint32_t rd = bits(x, 16, 8), coord = bits(x, 24, 8), dim = bits(x, 61, 3), mask = bits(x, 72, 4);
+    if (bits(x, 76, 5) || dim > 5 || bits(x, 81, 3) != 7 || bits(x, 84, 3) != 1 || bits(x, 87, 5) || mask == 0)
+        return (void)fail(l, "SULD mode");
+    Src h = {0};
+    h.kind = 2, h.cb_off = bits(x, 40, 14) * 4, h.cb_bank = bits(x, 54, 5);
+    if (!cbuf_ok(&h)) return (void)fail(l, "SULD handle");
+    uint32_t hr = to_reg(l, h, 4, 0, 0);
+    emit(l, 0xeb00000000000000ull | l->pred | rd | ((uint64_t)coord << 8) | ((uint64_t)mask << 20) | ((uint64_t)PT << 30) |
+                ((uint64_t)dim << 33) | ((uint64_t)hr << 39));
+}
+
 // ---- tensor-core instructions (Turing+), emulated with shuffles and half-precision FMAs
 //
 // The game's neural upscaler (NDSR) runs on them. The fragment layouts are PTX's (mma.m16n8k16, ldmatrix,
@@ -1838,9 +1862,12 @@ static void lower_tld4(L *l, const Insn *x, uint32_t op) {
     int dc = bits(x, 78, 1), half = bits(x, 79, 1), nodep = bits(x, 90, 1), array = dim == 5;
     int bindless = op == 0xf63;
     uint32_t handle = bindless ? to_reg(l, ur_src(l, bits(x, 40, 6)), 4, 0, 0) : RZ;
-    if ((dim != 1 && !array) || toff == 2 || toff == 3 || bits(x, 81, 3) != 7 || bits(x, 59, 1) || bits(x, 89, 1) ||
-        mask == 0 || half || !bits(x, 60, 1) || (bindless && bits(x, 46, 13)) || (!bindless && bank >= 18) ||
-        (dc && (toff || array)))
+    // Per-tap offsets (2, PTP: two registers of four x/y byte pairs after the coordinates, Maxwell's TLD4.PTP) and
+    // fp16 results (79: the four components packed in pairs into Rd and the second destination) since 2026-11-06:
+    // the level's final pass 7034cdb8 gathers with both.
+    if ((dim != 1 && !array) || toff == 3 || bits(x, 81, 3) != 7 || bits(x, 59, 1) || bits(x, 89, 1) ||
+        mask == 0 || !bits(x, 60, 1) || (bindless && bits(x, 46, 13)) || (!bindless && bank >= 18) ||
+        (dc && (toff || array)) || (half && (rd == RZ || (__builtin_popcount(mask) > 2 && rd2 == RZ))))
         return (void)fail(l, "TLD4 mode");
     int plain = !toff && !dc;
     uint32_t cx = ra, cy = plain && !array ? rb : (ra == RZ ? RZ : ra + 1);
@@ -1866,11 +1893,12 @@ static void lower_tld4(L *l, const Insn *x, uint32_t op) {
             mov_cbuf(l, S(l, 4), &s);
         }
         if (extra != RZ) mov_reg(l, S(l, 5), extra);
+        if (extra != RZ && toff == 2) mov_reg(l, S(l, 6), extra + 1);   // PTP: the second offsets register
         m0 = S(l, 4);
     }
     uint32_t components = (uint32_t)__builtin_popcount(mask);
     int split = rd2 != RZ;
-    int direct = (components <= 2 || (split ? rd2 == rd + 2 : 1)) && rd != RZ;
+    int direct = !half && (components <= 2 || (split ? rd2 == rd + 2 : 1)) && rd != RZ;
     uint32_t target = direct ? rd : S(l, 0);
     if (!bound) {
         emit(l, 0xdec0000000000000ull | l->pred | target | ((uint64_t)c0 << 8) | ((uint64_t)m0 << 20) |
@@ -1882,6 +1910,16 @@ static void lower_tld4(L *l, const Insn *x, uint32_t op) {
                     ((uint64_t)dc << 50) | ((uint64_t)7 << 51) | ((uint64_t)toff << 54) | ((uint64_t)comp << 56));
     }
     if (direct) return;
+    if (half) {   // pairs of components as halves: Rd = (c1 << 16) | c0, the second destination (c3 << 16) | c2
+        for (uint32_t pair = 0; pair < 2 && pair * 2 < components; pair++) {
+            uint32_t t = pair == 0 ? rd : split ? rd2 : rd + 1;
+            uint32_t lo = S(l, (int)(pair * 2)), hi = pair * 2 + 1 < components ? S(l, (int)(pair * 2 + 1)) : RZ;
+            emit(l, base(l, 0x5ca8000000000000ull, S(l, 6), 0) | ((uint64_t)1 << 8) | ((uint64_t)2 << 10) | ((uint64_t)lo << 20));
+            emit(l, base(l, 0x5ca8000000000000ull, S(l, 7), 0) | ((uint64_t)1 << 8) | ((uint64_t)2 << 10) | ((uint64_t)hi << 20));
+            emit(l, base(l, 0x5c18000000000000ull, t, S(l, 7)) | ((uint64_t)S(l, 6) << 20) | ((uint64_t)16 << 39));
+        }
+        return;
+    }
     for (uint32_t i = 0; i < components; i++) {
         uint32_t t = (!split || i < 2) ? (rd == RZ ? RZ : rd + i) : rd2 + (i - 2);
         if (t != RZ) mov_reg(l, t, S(l, (int)i));
@@ -1974,11 +2012,64 @@ static void h2_relu(L *l, uint32_t rd) {
 static void lower_hmnmx2(L *l, const Insn *x, uint32_t op) {
     uint32_t rd = bits(x, 16, 8), a = bits(x, 24, 8), b = bits(x, 32, 8), a_swz = bits(x, 74, 2), b_swz = bits(x, 60, 2);
     int is_min = bits(x, 87, 3) == 7 ? !bits(x, 90, 1) : -1;
-    if (op != 0x240 || is_min < 0 || bits(x, 62, 2) || bits(x, 72, 2) || bits(x, 76, 11)) return (void)fail(l, "HMNMX2 mode");
+    // Negated operands (a: bit 73, b: bit 62; the upscaler's 0a9afab0 takes max(-x, -y), 2026-11-06) become a
+    // subtraction from zero into scratch first, swizzle applied, so the sequence below sees plain pairs. Absolute
+    // values (72, 63) are not lowered.
+    if (op != 0x240 || is_min < 0 || bits(x, 63, 1) || bits(x, 72, 1) || bits(x, 76, 11)) return (void)fail(l, "HMNMX2 mode");
+    if (bits(x, 73, 1)) emit(l, l->pred | HADD2_SUB_R(S(l, 3), RZ, 0, a, a_swz)), a = S(l, 3), a_swz = 0;
+    if (bits(x, 62, 1)) emit(l, l->pred | HADD2_SUB_R(S(l, 4), RZ, 0, b, b_swz)), b = S(l, 4), b_swz = 0;
     uint32_t m = S(l, 1), d = S(l, 2);
     emit(l, l->pred | (is_min ? HSET2_GT_BF(m, b, b_swz, a, a_swz) : HSET2_GT_BF(m, a, a_swz, b, b_swz)));
     emit(l, l->pred | HADD2_SUB_R(d, a, a_swz, b, b_swz));
     emit(l, l->pred | (HFMA2_R(rd, m, 0, d, b) | ((uint64_t)b_swz << 35)));
+}
+
+// HMUL2 (0x232 register b; 0x432 / 0x832 an immediate half pair in 32-63; 0xa32 a constant, as HADD2's): packed
+// half multiply, HADD2's operand fields (a 24-31, swizzle 74-75, abs 73, neg 72; b swizzle 60-61, abs 62, neg 63),
+// saturate 77, FMZ 80 (2026-11-06: the level's upscaler and final pass). Maxwell HMUL2 R (Ryujinx InstHmul2R):
+// a 8-15, b 20-27, b swizzle 28-29, abs b 30, negate (the product) 31, sat 32, FMZ 39-40, abs a 44, a swizzle 47-48.
+static void lower_hmul2(L *l, const Insn *x, uint32_t op) {
+    uint32_t rd = bits(x, 16, 8), a = bits(x, 24, 8), a_swz = bits(x, 74, 2);
+    int a_abs = bits(x, 73, 1), a_neg = bits(x, 72, 1);
+    if (bits(x, 76, 1) || bits(x, 78, 2) || (bits(x, 81, 10) != 0 && op == 0x232)) return (void)fail(l, "HMUL2 mode");
+    uint32_t b, b_swz = 0; int b_abs = 0, b_neg = 0;
+    if (op == 0x232) {
+        b = bits(x, 32, 8), b_swz = bits(x, 60, 2), b_abs = bits(x, 62, 1), b_neg = bits(x, 63, 1);
+    } else if (op == 0x432 || op == 0x832) {
+        b = S(l, 0);
+        mov_imm(l, b, x->w[1]);
+    } else {
+        Src c = {0}; c.kind = 2, c.cb_off = bits(x, 38, 16), c.cb_bank = bits(x, 54, 5);
+        if (!cbuf_ok(&c)) return (void)fail(l, "HMUL2 constant");
+        b = S(l, 0), b_swz = bits(x, 60, 2), b_abs = bits(x, 62, 1), b_neg = bits(x, 63, 1);
+        mov_cbuf(l, b, &c);
+    }
+    emit(l, base(l, 0x5d08000000000000ull, rd, a) | ((uint64_t)b << 20) | ((uint64_t)b_swz << 28) | ((uint64_t)b_abs << 30) |
+                ((uint64_t)(a_neg ^ b_neg) << 31) | ((uint64_t)bits(x, 77, 1) << 32) | ((uint64_t)bits(x, 80, 1) << 39) |
+                ((uint64_t)a_abs << 44) | ((uint64_t)a_swz << 47));
+}
+
+// HSETP2 (0x234 register b: 32-39, swizzle 60-61, abs 62, neg 63; 0x434 an immediate half pair in 32-63): a
+// 24-31, swizzle 74-75, neg 72, abs 73; combine 69-70, H_AND 71, compare 76-79, FTZ 80, P 81-83, Q 84-86, input
+// predicate 87-89 (negated by 90) (Lichii's Ampere front end, GPL, read for the field meanings; 2026-11-06: the
+// level's upscaler 0a9afab0). Maxwell HSETP2 R (Ryujinx InstHsetp2R): P 3-5, Q 0-2, a 8-15, b 20-27, b swizzle
+// 28-29, abs b 30, neg b 31, compare 35-38, input 39-41 (negated by 42), neg a 43, abs a 44, combine 45-46,
+// a swizzle 47-48, H_AND 49, FTZ 6.
+static void lower_hsetp2(L *l, const Insn *x, uint32_t op) {
+    uint32_t b, bswz = 0, babs = 0, bneg = 0;
+    if (bits(x, 91, 1)) return (void)fail(l, "HSETP2 mode");
+    if (op == 0x434) {
+        b = S(l, 0);
+        mov_imm(l, b, x->w[1]);
+    } else {
+        if ((x->w[1] & 0x0fffff00u) || bits(x, 64, 5)) return (void)fail(l, "HSETP2 mode");
+        b = bits(x, 32, 8), bswz = bits(x, 60, 2), babs = bits(x, 62, 1), bneg = bits(x, 63, 1);
+    }
+    emit(l, 0x5d20000000000000ull | l->pred | bits(x, 84, 3) | ((uint64_t)bits(x, 81, 3) << 3) | ((uint64_t)bits(x, 80, 1) << 6) |
+                ((uint64_t)bits(x, 24, 8) << 8) | ((uint64_t)b << 20) | ((uint64_t)bswz << 28) | ((uint64_t)babs << 30) |
+                ((uint64_t)bneg << 31) | ((uint64_t)bits(x, 76, 4) << 35) | ((uint64_t)bits(x, 87, 3) << 39) |
+                ((uint64_t)bits(x, 90, 1) << 42) | ((uint64_t)bits(x, 72, 1) << 43) | ((uint64_t)bits(x, 73, 1) << 44) |
+                ((uint64_t)bits(x, 69, 2) << 45) | ((uint64_t)bits(x, 74, 2) << 47) | ((uint64_t)bits(x, 71, 1) << 49));
 }
 
 // F2FP (0x23e, Ampere) .PACK_AB: Rd = (half of Ra) << 16 | half of Rb, rounding 79-80 (round to nearest only).
@@ -2184,6 +2275,45 @@ static void lower_fswzadd(L *l, const Insn *x) {
 
 // R2UR (0x1c2): the uniform takes the register's value (the first active lane's on the console; every lane holds
 // the same value where the compiler relies on it, so a move stands in).
+// REDUX (0x3c4, 2026-11-06: 27 of the level's compute kernels): a warp-wide reduction of a general register
+// (24-31) over the active lanes into a uniform register (16-23). words[2] gives the operation: 0xc000 SUM (modulo
+// 2^32), 0x14000 MAX, 0x10000 MIN (unsigned, or signed with bit 73), 0x4000 OR, 0x8000 XOR (Lichii's Ampere front
+// end, GPL, read for the field meanings). Lowered as a pass over the 32 lanes: the active mask from VOTE.ANY, each
+// lane's value by SHFL.IDX, turned into the operation's identity where the lane is not in the mask by mask
+// arithmetic (no predicate: the programs have none to spare), and folded in. Signed MIN/MAX work in the unsigned
+// order with the sign bit flipped.
+static void lower_redux(L *l, const Insn *x) {
+    uint32_t target = ur_dst(l, bits(x, 16, 8)), src = bits(x, 24, 8), mode = x->w[2] & ~0x200u;
+    int sgn = bits(x, 73, 1), max = mode == 0x14000, min = mode == 0x10000, sum = mode == 0xc000;
+    uint32_t lop = mode == 0x4000 ? 1 : mode == 0x8000 ? 2 : 0;
+    if (x->w[1] || (!max && !min && !sum && !lop) || (sgn && !max && !min) || l->pred != (uint64_t)PT << 16)
+        return (void)fail(l, "REDUX mode");
+    if (target == RZ) return;                                   // the result is never read
+    uint32_t mask = S(l, 0), t = S(l, 1), k = S(l, 2), acc = S(l, 3);
+    emit(l, l->pred | 0x50d8000000000000ull | mask | ((uint64_t)PT << 39) | ((uint64_t)PT << 45) |
+                ((uint64_t)1 << 48));                                                     // VOTE.ANY mask, PT
+    mov_imm(l, acc, min ? 0xffffffffu : 0);
+    for (uint32_t lane = 0; lane < 32; lane++) {
+        emit(l, l->pred | 0xef10000000000000ull | t | ((uint64_t)src << 8) | ((uint64_t)lane << 20) | ((uint64_t)1 << 28) |
+                    ((uint64_t)1 << 29) | ((uint64_t)0x1f << 34) | ((uint64_t)PT << 48));   // SHFL.IDX
+        if (sgn) emit(l, l->pred | LOP32I | t | ((uint64_t)t << 8) | ((uint64_t)0x80000000u << 20) | ((uint64_t)2 << 53));      // ^ sign
+        emit(l, l->pred | SHL_IMM(k, mask, 31 - lane));                                              // lane's bit to the top
+        emit(l, l->pred | 0x3829000000000000ull | k | ((uint64_t)k << 8) | ((uint64_t)31 << 20));    // SHR.S32 31: 0 or ~0
+        if (min)   // c = t | ~k
+            emit(l, l->pred | 0x5c40000000000000ull | t | ((uint64_t)t << 8) | ((uint64_t)k << 20) | ((uint64_t)1 << 40) |
+                        ((uint64_t)1 << 41) | ((uint64_t)PT << 48));
+        else       // c = t & k
+            emit(l, l->pred | 0x5c40000000000000ull | t | ((uint64_t)t << 8) | ((uint64_t)k << 20) | ((uint64_t)PT << 48));
+        if (sum) emit(l, l->pred | 0x5c10000000000000ull | acc | ((uint64_t)acc << 8) | ((uint64_t)t << 20));   // IADD
+        else if (max || min)                                                                      // IMNMX.U32
+            emit(l, l->pred | 0x5c20000000000000ull | acc | ((uint64_t)acc << 8) | ((uint64_t)t << 20) | ((uint64_t)(max ? 15 : 7) << 39));
+        else emit(l, l->pred | 0x5c40000000000000ull | acc | ((uint64_t)acc << 8) | ((uint64_t)t << 20) | ((uint64_t)lop << 41) |
+                         ((uint64_t)PT << 48));                                                   // LOP OR / XOR
+    }
+    if (sgn) emit(l, l->pred | LOP32I | acc | ((uint64_t)acc << 8) | ((uint64_t)0x80000000u << 20) | ((uint64_t)2 << 53));
+    mov_reg(l, target, acc);
+}
+
 static void lower_r2ur(L *l, const Insn *x) {
     uint32_t target = ur_dst(l, bits(x, 16, 8));
     if (x->w[1] || x->w[2] != 0x000e0000u) return (void)fail(l, "R2UR mode");
@@ -2715,8 +2845,11 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0x386: case 0x986: return lower_stg(l, x, op);
     case 0xb60: case 0xf60: case 0x361: return lower_tex(l, x, op);
     case 0xb9b: return lower_sust(l, x);
+    case 0xb97: return lower_suld(l, x);
     case 0x231: case 0x431: case 0x631: case 0x831: case 0xa31: return lower_hfma2(l, x, op);
     case 0x23e: return lower_f2fp(l, x, op);
+    case 0x234: case 0x434: return lower_hsetp2(l, x, op);
+    case 0x232: case 0x432: case 0x832: case 0xa32: return lower_hmul2(l, x, op);
     case 0x240: return lower_hmnmx2(l, x, op);
     case 0xb1d: return lower_bar(l, x);
     case 0x83b: return lower_ldsm(l, x);
@@ -2742,6 +2875,7 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0x3c4: return lower_redux(l, x);
     case 0x822: return lower_fswzadd(l, x);
     case 0x3c2: return lower_r2ur(l, x);
+    case 0x3c4: return lower_redux(l, x);
     default:
         if (base_op >= 0x080 && base_op < 0x100) return lower_uniform_alu(l, x, op);
         {

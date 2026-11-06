@@ -39,7 +39,7 @@
 #include "vk.h"
 #include "vk_exec.h"
 
-#define MAX_PASSES 400
+#define MAX_PASSES 1200
 #define PNG_CAP (2ull << 30)
 #define INFLIGHT_CAP (3ull << 30)   // host buffers waiting for their submission
 #define MAX_ENTS 512                // distinct pipeline + texture sets listed per pass
@@ -1096,6 +1096,20 @@ void vk_dump_xfb(VkExec *ex, uint32_t op, const void *payload) {
                 (unsigned long long)((const p_xfb_ctl *)payload)->control);
     }
 out:
+    ReleaseSRWLockExclusive(&rec_lock);
+}
+
+// A line of the replay's own in the frame's passes.txt (e.g. a draw left out for a shader that did not translate).
+void vk_dump_note(const char *fmt, ...) {
+    AcquireSRWLockExclusive(&rec_lock);
+    if (active() && passes_f) {
+        va_list ap;
+        va_start(ap, fmt);
+        fprintf(passes_f, "note after pass %d: ", seq - 1);
+        vfprintf(passes_f, fmt, ap);
+        fputc('\n', passes_f);
+        va_end(ap);
+    }
     ReleaseSRWLockExclusive(&rec_lock);
 }
 

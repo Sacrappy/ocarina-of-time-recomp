@@ -268,8 +268,22 @@ Open, in order:
   the level runs (662 frames, A/B against the old rule: device lost after 14) and the Deku Tree's dialogue plays
   (subtitles over a still black scene). Also translator patch 0018: NMin/NMax/NClamp and a saturating, NaN-to-0 F2I,
   as Maxwell defines them (not the cause, but SPIR-V left them undefined).
-- The scene behind the dialogue is black: 474 graphics texture slots of the dumped level frame read no handle
-  (as the compute ones did; check the graphics side of the bank-0 and bindless handle paths first).
+- The scene behind the dialogue was black for two reasons (2026-11-06, dumps of frame 1500 with
+  `OOT_DUMP_SKIP_RUNS=1`; the dump's pass cap is now 1200 and it notes draws and dispatches skipped for a missing
+  shader, with the code hash `tools/kernel.py` prints):
+  - The last steps of the frame, the 1080p-to-1440p kernel 0a9afab0 and the kernel after it 7034cdb8, did not
+    lower; the frame showed only the subtitles drawn over an empty target. The lowering now has SULD (23 level
+    kernels), REDUX (27), HSETP2, HMUL2, negated HMNMX2 operands and TLD4 with per-tap offsets and fp16 results.
+    With them the level shows: the sky and the forest's shapes (`build/logs/level-up.png`), the geometry still
+    mostly black.
+  - The volumetric fog: kernel 1a62084a (8x4x4 groups, the 64x36x96 in-scattering volumes) writes only 0 and NaN,
+    and the integration along depth and the fog's full-screen pass carry the NaN into every pixel of the scene.
+    Its uniform blocks, textures and storage buffers are bound and plausible; the cause is open.
+    `OOT_SKIP_CS=1a62084a` leaves the fog out for now.
+  - The materials: most fragment shaders take their texture handles from memory (bindless: a handle loaded into a
+    register, R2UR, then TEX through a uniform register), which Ryujinx 1.3.2 cannot resolve; they sample the
+    placeholder. True bindless (a descriptor array over the texture pool, indexed in the shader) is the next big
+    piece.
 - 605 programs the lowering refuses in the level (`gfx_shader: translation failed`), so about 280 of 744 draws are
   skipped: unknown opcodes 261, `TEX unpacked operands` 128, scratch and predicate pressure 53, `RED address` 37,
   uniform datapath opcodes 35, and smaller groups (TLD, TLD4, HMNMX2, PLOP3, STG of wide zeros).
