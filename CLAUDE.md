@@ -48,8 +48,9 @@ plays on screen, upscaled to 2560x1440 by the game's neural network through the 
 the title plays at 60 fps. The shader cache keys carry the translator identity and `KEY_VERSION`
 (`gfx_shader.c`): bump the latter after a lowering change. The first run after a translator or lowering change spends
 a minute building the kernels' pipelines (the driver's disk cache keeps them); about one run in two dies right after
-the first frame (an SDK abort in MultiWait, see the docs). The level's materials sample a placeholder until pool-indexed (bindless) textures are
-bound: `docs/bindless.md` is the hand-off for that work.
+the first frame (an SDK abort in MultiWait, see the docs). Pool-indexed (bindless) textures are bound through a persistent pool set with GPU sampling
+feedback (`docs/bindless.md`, Status of 2026-11-06 afternoon); the level's geometry is still black with them; the likelier
+cause is the 64 level programs whose SM86 lowering fails (their draws and dispatches are skipped).
 
 ## Running and checking
 

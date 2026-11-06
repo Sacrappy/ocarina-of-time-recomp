@@ -94,25 +94,26 @@ typedef struct {
     uint16_t handle;            // TEX/IMG: raw handle (word offset; separate: texture | sampler << 14); SSBO: address offset
     uint16_t count;             // descriptors (array length)
     uint8_t separate;           // TEX: texture and sampler handles are separate
-    uint8_t pool_array;         // TEX: Ryujinx's bindless pool array (handle 0x40000000), filled from the bound pool
+    uint8_t bindless;           // TEX/IMG: a pool-indexed array (Ryujinx BindlessElimination: handle 0x40000000, cbuf 0)
+    uint8_t pool;               // TEX: GFX_POOL_* binding + 1 of that array in the pool set; 0: not one, or unsupported
 } GfxShaderRes;
+// Pool-indexed (bindless) sampling. The translator turns a sample through a handle loaded from a constant buffer into an
+// index into arrays standing for the bound pools: texture id (handle & 0xfffff) into an array of GFX_POOL_TEXTURES
+// separate images per view type, sampler id (handle >> 20) into an array of GFX_POOL_SAMPLERS samplers
+// (tools/xlate/Program.cs TexturePoolLength, SamplerPoolLength). gfx_shader.c moves those arrays to set GFX_POOL_SET,
+// one binding per view type below; a 2D shadow array shares the 2D binding (Vulkan ignores an image type's Depth
+// operand). Every pipeline layout carries the pool set there (vk_pipeline.c), and the replay keeps one persistent set
+// per bound pool pair (vk_exec_draw.c pool sets).
+#define GFX_POOL_SET 2
+#define GFX_POOL_TEXTURES 65536
+#define GFX_POOL_SAMPLERS 4096
+enum { GFX_POOL_SAMPLER, GFX_POOL_1D, GFX_POOL_2D, GFX_POOL_3D, GFX_POOL_CUBE, GFX_POOL_1D_ARRAY, GFX_POOL_2D_ARRAY,
+       GFX_POOL_CUBE_ARRAY, GFX_POOL_BINDINGS };
+// Sampling feedback: a storage buffer of one uint per texture id after the arrays. gfx_shader.c makes every access to a
+// pool texture array store 1 at its id first, and the replay creates only the textures the GPU asked for (creating
+// every live texture of OoT's pool took more than the 12 GB of VRAM).
+#define GFX_POOL_FEEDBACK GFX_POOL_BINDINGS
 typedef struct { uint8_t type, comps, packed; } GfxShaderIo;   // GFX_TYPE_*, components, 1 with a Component decoration
-
-// Ryujinx's bindless pool arrays (Translation/Optimizations/BindlessElimination.cs GenerateBindlessAccess): a texture
-// or sampler handle loaded from a constant buffer turns into `array[min(id, length - 1)]`, where the id indexes the NVN
-// pool bound with SetTexturePool / SetSamplerPool. The lengths are the measured pool sizes of this game's pools
-// (`nvn: TexturePool n=33068`, `nvn: SamplerPool n=4096` in an OOT_TRACE=gfx log), and tools/xlate/Program.cs answers
-// the same numbers so the shader's clamp and the host's arrays agree. A pool with more descriptors than this needs both
-// bumped; nvn_api_obj.c's dpool_slot says so (it refuses a pool beyond the slot space a handle can name).
-#define GFX_POOL_TEX_SLOTS  33068
-#define GFX_POOL_SAMP_SLOTS 4096
-// The host keeps these arrays in a descriptor set of their own, one binding per kind, every element indexed by NVN pool
-// id (runtime/vk_pipeline.c pool_layout, runtime/vk_exec_draw.c pool_set). Which binding a pool array of a given
-// SamplerType goes to; -1 for a kind the host cannot bind (nothing is bound, and the draw samples the placeholder).
-enum { GFX_POOL_SAMP, GFX_POOL_TEX_2D, GFX_POOL_TEX_2D_ARRAY, GFX_POOL_TEX_2D_SHADOW, GFX_POOL_TEX_2D_ARRAY_SHADOW,
-       GFX_POOL_TEX_CUBE, GFX_POOL_TEX_3D, GFX_POOL_KINDS };
-int gfx_pool_binding(uint16_t sampler_type);                 // a GFX_POOL_* binding, -1 for an unsupported kind
-int gfx_pool_is_sampler(const GfxShaderRes *r);              // 1: the sampler array (type 0, Ryujinx's SamplerType.None)
 int gfx_shader_stage(const GfxShader *s);                   // GFX_STAGE_VS, GFX_STAGE_FS or GFX_STAGE_CS
 int gfx_shader_resources(const GfxShader *s, int kind, const GfxShaderRes **res);   // count of GFX_RES_* kind; array in *res
 uint32_t gfx_shader_slot_mask(const GfxShader *s);                    // texture/image slots whose type its translation read

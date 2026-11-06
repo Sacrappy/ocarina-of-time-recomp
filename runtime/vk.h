@@ -311,6 +311,8 @@ void vk_texture_lock(void);
 void vk_texture_unlock(void);
 const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view);
 VkSampler vk_sampler_by_id_locked(int id);
+// The same for pool-indexed sampling: NULL when no live texture object has the slot's storage (a stale pool entry).
+const VkTexImage *vk_texture_live_by_id_locked(int id, view_t *view, int *has_view);
 // The slot's sampler with nearest filtering and no anisotropy: a depth texture read without a compare lands on one texel
 // on the Switch although the game binds a linear sampler, and MacNativeGames samples it the same way. VK_NULL_HANDLE
 // for an empty slot.
@@ -452,7 +454,10 @@ typedef struct {
     // Descriptor update template per set (vk_pipeline.c make_tpl): reads one VkDescSlot per descriptor, in binding order,
     // from the start of the set's descriptors. VK_NULL_HANDLE: the set is written with VkWriteDescriptorSet structs.
     VkDescriptorUpdateTemplate tpl[2];
+    // GFX_POOL_* bindings (bit per binding) the shaders index: the replay binds its pool set at GFX_POOL_SET (gfx.h).
+    uint32_t pool_mask;
 } VkPipeInfo;
+VkDescriptorSetLayout vk_pipeline_pool_layout(void);   // the pool set's layout; VK_NULL_HANDLE without descriptor indexing
 // One descriptor of the packed array a descriptor update template reads (VkPipeInfo.tpl), 24 bytes for every type; the
 // bytes a type leaves unused are zero, so equal descriptors compare equal byte for byte.
 typedef union { VkDescriptorImageInfo image; VkDescriptorBufferInfo buffer; VkBufferView view; uint64_t w[3]; } VkDescSlot;

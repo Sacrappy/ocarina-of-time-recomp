@@ -123,19 +123,73 @@ Pools on the host:
 
 ## Status
 
-- 2026-11-06: findings above; nothing implemented.
-- 2026-11-06, later: steps 2-6 implemented (commit on `bindless`; `build/bindless-report.md` has the measurements).
-  `Program.cs` answers the measured pool lengths (33068 texture, 4096 sampler) and
-  `QueryHostSupportsShaderNonUniformIndexing` true; a pool array takes one binding number, not one per element. The
-  host checks the descriptor-indexing features in `vk_device.c` (`OOT_POOL_ARRAYS=0` disables the path) and keeps the
-  arrays in a descriptor set of their own (`vk_pipeline.c pool_layout`: one binding per view kind, UPDATE_AFTER_BIND and
-  PARTIALLY_BOUND, at set index 1, or 2 with independent layouts). `spirv_pool` moves each stage's pool arrays there and
-  renumbers them, so `bind_resources` never writes them; `vk_exec_draw.c pool_set` writes the set once per bound pool
-  pair and then only refreshes the elements whose slot token changed. The fill is progressive
-  (`OOT_POOL_FILL_PER_FRAME`, 4096 elements a frame): a one-shot fill of every pool id ends in
-  `VK_ERROR_DEVICE_LOST` on this GPU. Measured: the 2D array resolves 7688 of 33068 ids (the rest are unregistered ids
-  that get the placeholder), the sampler array is empty at the level's first pool-array draw because the bound sampler
-  pool has no registrations yet. The draw path itself is still untested end to end: the level's first frame dies in the
-  guest at `main+0x166215c` (the mid-function-return bug the `snapshot` branch fixes), in both the old and the new code,
-  so no level frame is ever presented and no screenshot can show the materials yet.
+- 2026-11-06 (morning): findings above; nothing implemented.
+- 2026-11-06 (afternoon): pool-indexed sampling implemented; the level's pool samples reach their textures, but the
+  scene stays mostly black for another reason (below). Not committed yet.
 
+### What was built
+
+- **Pool sizes** (plan step 1, from an `OOT_TRACE=gfx` log): one texture pool of 33068 descriptors, one sampler pool
+  of 4096. That ruled out the plan's "simple version" (about 100,000 descriptor writes per program per draw).
+- **Translator** (`tools/xlate/Program.cs`): pool arrays of 65536 textures and 4096 samplers (`TexturePoolLength`,
+  `SamplerPoolLength`); such an array takes one binding number (the accessor advanced `_binding` by the array length,
+  so the bindings after a pool array passed 65535 and wrapped in the host's 16-bit fields: "uses binding 135181",
+  then a device loss); the translator's own `Log` messages go into the `.res.json` notes. No translation of the level
+  route logged "Failed to find handle source" (1254 translations), so every pool access resolved to the arrays.
+- **Reflection** (`runtime/gfx_shader.c` `add_res`, `move_pool_arrays`, `add_pool_feedback`): a resource with handle
+  `0x40000000` in cbuf 0 is `bindless`, and `pool` names its binding in the pool set (`gfx.h` `GFX_POOL_*`: samplers 0,
+  one binding per view type 1-7, 2D shadow shares 2D). At load the module's decorations move those variables to set
+  `GFX_POOL_SET` (2) in place, and every access chain into a pool texture array gets a store of 1 into a feedback
+  buffer at binding 8 (`OOT_POOL_SPV_DUMP=1` writes the first patched modules out; all pass `spirv-val`).
+  Pool-indexed images, buffer textures and multisampled arrays are logged and keep the placeholder (none met yet).
+- **Layouts** (`runtime/vk_pipeline.c` `pool_layout_init`): one pool set layout, update-after-bind and partially bound,
+  at set 2 of every pipeline layout (an empty set fills set 1 where a layout has one set of its own); the pool arrays
+  stay out of the per-draw binding lists (`Bindings.pool`, `VkPipeInfo.pool_mask`). Needs the descriptor-indexing
+  features and limits checked there; without them pool-indexing pipelines fail.
+- **Replay** (`runtime/vk_exec_draw.c` "pool sets"): one persistent set per bound pool pair, bound at set 2 before a
+  draw or dispatch that indexes it. Only ids the GPU sampled get their texture: each submission that bound a set
+  copies its device-local feedback buffer into a host-cached one at its end (`vk_exec_pool_feedback`), and
+  `pool_sync` reads it every 30 ms; a sampled id joins the wanted list and is resolved from then on (a token compare
+  per wanted id when slots change, the per-submit storage check for CPU-written textures). Unsampled ids hold the
+  stand-in of their view type.
+- `OOT_POOL_SKIP=1` (diagnostic): pipelines that index the pools fail, so their draws are skipped.
+
+### Found on the way
+
+- **Every live texture does not fit.** Resolving all 33068 ids created an image for each live texture (images are made
+  on first lookup, ASTC decodes to RGBA8): 11.5-12 GB of the 4070's 10.7 GB budget. Hence the GPU feedback.
+- **Stale pool entries.** The pool keeps descriptors of finalized textures, some over storage that is no longer
+  mapped. Uploading those faulted in `tex_bl_copy` (reads of 0x5864xxxxx): `vk_texture.c` `upload` now checks the
+  storage is committed (`storage_readable`) and uploads zeros otherwise. Resolving a finalized texture brought it back
+  as an entry that is never released, which under VRAM pressure dropped released entries, which came back the same
+  way: the pool path uses `vk_texture_live_by_id_locked`, which answers only for storage a live texture object has
+  (`nvn_tex_live_at`).
+- **Feedback reads.** Reading the feedback buffer in place (host-visible VRAM through the BAR) took about 20 ms per
+  sync; the copy into host-cached memory brought the pool sets' CPU time to about 300 ms over the 150 s route, most
+  of it the first fill of the bindings.
+- **NonUniform is off.** With `QueryHostSupportsShaderNonUniformIndexing` on, the level route lost the device in runs
+  345 and 346 (346 with `OOT_POOL_SKIP=1`, so not through the pool arrays) and hung the GPU in 338 and 342, each time
+  with 43 instruction pointers inside one small code range (warps stuck in one shader); runs 335 and 336 were clean.
+  Off, runs 350 and 352 were clean. Ryujinx decorates the access chain but not the load from it; whether that is what
+  the driver trips on is not known. Divergent pool indices are undefined without the decoration, so watch for seams.
+
+### Where the level is
+
+- Measured on the level route (`--replay build/logs/a-spam.txt --skip-movies --env OOT_SKIP_CS=1a62084a --trace perf
+  --shot`): only **14 pool ids** are ever sampled, and the change in the picture is the sky (a gradient with a warm
+  horizon instead of flat white: `build/logs/level-before.png`, run 348, against `build/logs/level-pool.png`, run 352;
+  both score as pictures, noise 0.26 and 0.18). The geometry is black in both. So the black materials are not the pool
+  arrays. The same route logs 64 distinct programs whose SM86 lowering fails ("no general register free for
+  scratch", "RED address", "opcode", "PLOP3 table", "uniform datapath opcode", "TLD mode", ...), whose draws and
+  dispatches are skipped: that is the next thing to look at (`docs/phase3.md`).
+- The route runs at 0.6-0.9 fps once the level is up, GPU-bound (0.4-1.2 s of GPU time per frame), before this
+  change as well (run 348, committed code): not a regression, but the "about 17 fps" above was not reproduced.
+- The title is unaffected: grass loop at 30 s scores 0.53 (`build/logs/check-pool.png`, run 351).
+
+### Left open
+
+- Turning NonUniform back on safely (decorate the load too, or find the shader that hangs).
+- Textures are never given back once sampled (the feedback is never cleared); fine for 14 ids, not for a large world.
+- A pool texture that is also an attachment of the open pass (the feedback-loop scan sees bound slots only), and the
+  depth-without-compare point sampler that bound slots get (`tex_info_lookup`).
+- `--selftest` fails "MapPhysicalMemory beyond the pool is not LimitReached", with and without this change.

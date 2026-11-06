@@ -1012,6 +1012,7 @@ int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint64_t 
     vk_exec_pass_end(ex);
     x_here = 0;
     if (ex->recorded) vk_exec_barrier(ex);   // later submissions see this one's writes
+    vk_exec_pool_feedback(ex);               // pool sets: the sampled texture ids, for the host (vk_exec_draw.c)
     if (n) ex->recorded += vk_mem_mirror_end(ex->cb, fence), vk_usnap_end(fence);   // VRAM mirror bytes the GPU wrote go back to guest memory
     if (ex->nviews) {
         ViewList *l = malloc(sizeof *l + sizeof(VkImageView) * (size_t)ex->nviews);
