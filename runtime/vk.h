@@ -41,7 +41,6 @@ typedef struct VkCtx {
         has_conditional_rendering, has_transform_feedback, has_provoking_vertex, has_device_fault, has_memory_budget,
         has_robustness2, has_buffer_device_address, has_fragment_shader_interlock, has_buffer_marker, has_nv_checkpoints,
         has_astc_ldr,                       // textureCompressionASTC_LDR (enabled when reported)
-        has_pool_arrays,                    // descriptor indexing: the bindless pool arrays (docs/bindless.md)
         has_coopmat;                        // VK_KHR_cooperative_matrix (compute; --probe-coopmat)
     // Feedback loops (maxwell.md 1.9, vk_exec_draw.c feedback_prepare): a draw samples a target of its open pass that
     // an earlier draw of the pass wrote. OOT_FEEDBACK=0: VK_FEEDBACK_OFF (sampled in GENERAL without a barrier, the
@@ -446,11 +445,6 @@ typedef struct {
     VkDescriptorSetLayout set_layout1;
     int push1;
     uint32_t n_sets;
-    // The bindless pool arrays (gfx.h GFX_POOL_*): a set of their own at pool_index (n_sets without them: 1, or 2 with
-    // independent layouts), holding one array per kind, written once per bound pool (vk_exec_draw.c pool_set). pool_set
-    // VK_NULL_HANDLE: the pipeline has none. pool_uses: the bindings the stages use, as a GFX_POOL_* mask.
-    VkDescriptorSetLayout pool_set;
-    uint32_t pool_index, pool_uses;
     // Descriptor update template per set (vk_pipeline.c make_tpl): reads one VkDescSlot per descriptor, in binding order,
     // from the start of the set's descriptors. VK_NULL_HANDLE: the set is written with VkWriteDescriptorSet structs.
     VkDescriptorUpdateTemplate tpl[2];

@@ -731,7 +731,6 @@ static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
     r->handle = (uint16_t)handle;
     r->count = (uint16_t)json_int(o, e, "array", 1);
     r->separate = sep && *sep == 't';
-    r->pool_array = handle >= 0x40000000;   // GenerateBindlessAccess: a texture/sampler pool array
     r->slot = (int16_t)handle_slot(kind, r->cbuf_slot, handle, r->separate);
     // A pool array (BindlessElimination: TextureHandle.PackOffsets(0, 0, Direct) in constant buffer 0) gets its pool
     // set binding; storage images, buffer textures and multisampled arrays from a pool are not supported yet and
@@ -868,21 +867,6 @@ static void move_pool_arrays(GfxShader *s) {
     }
     free(bind_at), free(set_at);
     if (ntv) add_pool_feedback(s, tex_vars, ntv);
-}
-
-// Ryujinx's SamplerType.None (0) names the sampler array GenerateBindlessAccess pairs with a texture array; every other
-// kind is a texture array of one dimension, with the flags of GfxShaderRes.type (0x100 array, 0x400 shadow).
-int gfx_pool_is_sampler(const GfxShaderRes *r) { return r->type == 0; }
-
-int gfx_pool_binding(uint16_t t) {
-    int shadow = (t & 0x400) != 0, arr = (t & 0x100) != 0;
-    if (t & 0x200) return -1;   // multisample: never a pool array
-    switch (t & 0xff) {
-    case 3: return shadow ? (arr ? GFX_POOL_TEX_2D_ARRAY_SHADOW : GFX_POOL_TEX_2D_SHADOW) : (arr ? GFX_POOL_TEX_2D_ARRAY : GFX_POOL_TEX_2D);
-    case 4: return GFX_POOL_TEX_3D;
-    case 5: return GFX_POOL_TEX_CUBE;
-    default: return -1;         // 1D, buffer and rect have no array form here
-    }
 }
 
 // SPIR-V opcodes and enumerants used below (SPIR-V 1.6 specification, section 3).

@@ -88,8 +88,6 @@ typedef struct VkExec {
     uint64_t tex[6][128], samp[6][128], img[6][32];   // OP_BIND_TEX / OP_BIND_SAMP / OP_BIND_IMG handles per stage
     uint8_t push_cc[0x800];              // OP_PUSH_CC (VK_C0_BYTES, defined below): the compute kernels' pushed constants (NVN2), read as bank 0
     uint32_t push_cc_len;                // bytes pushed so far (0: none, c0 is the driver bank)
-    uint8_t push_gc[0x800];              // OP_PUSH_GC: the graphics stages' pushed constants (NVN2), over the driver bank
-    uint32_t push_gc_len, push_gc_lo;    // bytes pushed so far and the first offset written (0: none)
 
     // ---- vk_exec_xfer.c slots (render enable, conditional rendering): left empty by vk_exec.c
     int render_disabled;                 // OP_RENDER_ENABLE false or a failed OP_RENDER_COND: clears and draws skip
@@ -131,9 +129,6 @@ void vk_exec_pass_end(VkExec *ex);
 // Full memory barrier (all commands, all memory); ends the open pass first. Copies and dispatches order themselves with
 // it. Skipped when nothing was recorded since the last one.
 void vk_exec_barrier(VkExec *ex);
-// vk_exec_xfer.c: a whole-image linear blit between two GENERAL-layout 2D colour images (vk_exec_draw.c's replacement
-// for the game's neural upscaler pass). 1 when it was recorded; 0 for images it cannot blit.
-int vk_exec_blit_linear(VkExec *ex, const VkTexImage *src, const VkTexImage *dst);
 // vk_texture.c (OOT_TEX_ALIAS): commands that must run at the replay's current position. vk_exec_inline_begin returns
 // the command buffer being recorded after a full barrier (an open pass is ended; *reopen says so), or VK_NULL_HANDLE
 // when this thread is not recording a replay. vk_exec_inline_end begins the pass again when it was open.
@@ -195,7 +190,7 @@ void vk_dump_present(uint64_t frame);    // vk_be_present: waits for the dump fr
 // VK_C0_BYTES, stage an NVN stage (0 vertex, 1 fragment, 5 compute), ssbo and ubo the 16 bound slots of that stage.
 #define VK_C0_BYTES 0x800u
 void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16], const p_bind_buf ubo[16],
-                const uint32_t dispatch[3], uint32_t base_instance, const uint8_t *push, uint32_t push_len);
+                const uint32_t dispatch[3], uint32_t base_instance);
 
 // Handler hooks. vk_exec.c defines both WEAK: they stop with rt_fatal naming the op.
 // vk_exec_draw.c: OP_DRAW, OP_DRAW_IDX, OP_DISPATCH, OP_BIND_* (program, state, vattr, vstream, vbuf, ubo, ssbo, tex,
