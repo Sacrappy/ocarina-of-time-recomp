@@ -729,6 +729,7 @@ static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
     r->handle = (uint16_t)handle;
     r->count = (uint16_t)json_int(o, e, "array", 1);
     r->separate = sep && *sep == 't';
+    r->pool_array = handle >= 0x40000000;   // GenerateBindlessAccess: a texture/sampler pool array
     r->slot = (int16_t)handle_slot(kind, r->cbuf_slot, handle, r->separate);
 }
 

@@ -2236,35 +2236,6 @@ static void lower_vote(L *l, const Insn *x) {
                 ((uint64_t)bits(x, 72, 2) << 48));
 }
 
-// REDUX (0x3c4): a warp-wide reduction into a uniform register. .SUM (modulo 2^32) and unsigned .MAX over the active
-// lanes are the forms the level's shaders use, all unpredicated. Maxwell has no warp reduction, so this is the active
-// mask (a ballot) and one shuffle per lane: inactive lanes contribute zero, which changes no unsigned max and no sum.
-static void lower_redux(L *l, const Insn *x) {
-    uint32_t dest = bits(x, 16, 8), source = bits(x, 24, 8), mode = x->w[2] & ~0x200u;
-    int maximum = mode == 0x14000, sum = mode == 0xc000;
-    if (bits(x, 12, 4) != 7 || dest >= 63 || x->w[1] || bits(x, 73, 1) || (!maximum && !sum))
-        return (void)fail(l, "REDUX mode");
-    uint32_t target = ur_dst(l, dest);
-    if (target == RZ) return;   // the reduced value is never read
-    uint32_t mask = S(l, 0), v = S(l, 1), act = S(l, 2);
-    emit(l, 0x50d8000000000000ull | l->pred | mask | ((uint64_t)7 << 39) | ((uint64_t)7 << 45) | ((uint64_t)1 << 48));
-    mov_imm(l, target, 0);
-    for (uint32_t lane = 0; lane < 32; lane++) {
-        emit(l, l->pred | SHFL_IDX_R(v, source, lane));
-        emit(l, l->pred | SHR_IMM(act, mask, lane));
-        emit(l, l->pred | (uint64_t)(LOP32I | act | ((uint64_t)act << 8) | ((uint64_t)1 << 20)));   // act &= 1
-        emit(l, 0x5c10000000000000ull | l->pred | act | ((uint64_t)RZ << 8) | ((uint64_t)act << 20) |
-                    ((uint64_t)1 << 48));                                                            // act = -act
-        emit(l, 0x5be0000000000000ull | l->pred | v | ((uint64_t)v << 8) | ((uint64_t)act << 20) |
-                    ((uint64_t)0xc0 << 28) | ((uint64_t)RZ << 39) | ((uint64_t)7 << 48));            // v &= act
-        if (maximum)
-            emit(l, 0x5c20000000000000ull | l->pred | target | ((uint64_t)target << 8) | ((uint64_t)v << 20) |
-                        ((uint64_t)15 << 39));                                                       // max(U32)
-        else
-            emit(l, 0x5c10000000000000ull | l->pred | target | ((uint64_t)target << 8) | ((uint64_t)v << 20)); // sum
-    }
-}
-
 // FSWZADD (0x022): per-lane add/subtract pattern at 32-39; Maxwell's lane codes 1 and 2 are swapped.
 static void lower_fswzadd(L *l, const Insn *x) {
     uint32_t rd = bits(x, 16, 8), swz = x->w[1];
@@ -2872,7 +2843,6 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0x81c: return lower_plop3(l, x);
     case 0xf89: case 0x589: case 0x989: return lower_shfl(l, x, op);
     case 0x806: return lower_vote(l, x);
-    case 0x3c4: return lower_redux(l, x);
     case 0x822: return lower_fswzadd(l, x);
     case 0x3c2: return lower_r2ur(l, x);
     case 0x3c4: return lower_redux(l, x);

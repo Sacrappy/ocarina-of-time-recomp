@@ -42,6 +42,8 @@ typedef struct { NVNdevice *dev; void *mem; uint64_t size; uint32_t flags; } poo
 typedef struct { uint32_t magic, flags; uint8_t *mem; uint64_t size; uint8_t *game_mem, *host; uint64_t span; } pool_t; FITS(pool_t, NVNmemoryPool);
 
 typedef struct { const pool_t *pool; int64_t off; int32_t n; } dpool_t;                       // Texture / sampler descriptor pool
+int nvn_tpool_slot(const dpool_t *p, int id);   // the back end's global slot of a pool texture id
+int nvn_spool_slot(const dpool_t *p, int id);   // the same for a sampler id
 FITS(dpool_t, NVNtexturePool); FITS(dpool_t, NVNsamplerPool);
 
 typedef struct {

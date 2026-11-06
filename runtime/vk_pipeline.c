@@ -1084,6 +1084,7 @@ static VkDescriptorType descriptor_type(int kind, const GfxShaderRes *r) {
     case GFX_RES_SSBO: return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     case GFX_RES_TEX:
         if (buffer) return VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+        if (r->type == 0) return VK_DESCRIPTOR_TYPE_SAMPLER;   // Ryujinx's bindless sampler array
         if (r->separate) LOG_ONCE("vk_pipeline: a separate texture handle: bound as SAMPLED_IMAGE");
         return r->separate ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     default: return buffer ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;

@@ -1555,7 +1555,8 @@ static VkDescriptorSet alloc_set(VkExec *ex, VkDescriptorSetLayout layout) {
         }
         static const VkDescriptorPoolSize sizes[] = {
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4096}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2048},
-            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16384}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024},
+            {VK_DESCRIPTOR_TYPE_SAMPLER, 4096}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16384},
+            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024},
             {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 256},
             {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 256}};
         VkDescriptorPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 256,
@@ -1918,7 +1919,17 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
                 for (uint32_t k = 0; k < cnt; k++) {
                     int slot = r->slot + (int)k;
                     uint64_t h = 0;
-                    if (r->cbuf_slot >= 3 || (r->cbuf_slot == 0 && slot < 0)) h = cbuf_handle(ex, st, r, k);
+                    if (r->pool_array) {
+                        // Ryujinx's bindless pool arrays (handle 0x40000000): element k is pool id k, not a c0 word.
+                        if (r->type == 0) {   // the sampler array of the same program
+                            int sid = ex->samp_pool ? nvn_spool_slot(ex->samp_pool, (int)k) : 0;
+                            o[k].image = (VkDescriptorImageInfo){sid ? vk_sampler_by_id_locked(sid) : Z.samp,
+                                                                 VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+                            o[k].w[2] = 0;
+                            continue;
+                        }
+                        h = ex->tex_pool ? (uint64_t)nvn_tpool_slot(ex->tex_pool, (int)k) : 0;
+                    } else if (r->cbuf_slot >= 3 || (r->cbuf_slot == 0 && slot < 0)) h = cbuf_handle(ex, st, r, k);
                     else if (img) h = slot >= 0 && slot < 32 ? ex->img[st][slot] : 0;
                     else h = slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0;
                     {   // OOT_CS_DUMMY_TEX=1 (diagnostic, 2026-11-06): compute shaders read the dummy texture instead of
