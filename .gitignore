@@ -26,6 +26,10 @@ __pycache__/
 *.nso
 *.npdm
 
+# Crash dumps written by the game or its GPU driver next to the executable
+fault-vendor.bin
+*.nv-gfx-crash*
+
 # Build outputs
 *.exe
 *.dll
