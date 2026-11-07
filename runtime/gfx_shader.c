@@ -1278,6 +1278,24 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
         o += sprintf(o, ",\"local\":[%u,%u,%u]", l[0], l[1], l[2]);
     }
     if (!strcmp(stage, "ts") || !strcmp(stage, "ms")) {
+        // One line per distinct task/mesh control shape: the workgroup size and the mesh limits drive the translator's
+        // epilogue (which vertices an invocation writes) and the stage buffer's size.
+        static struct { uint32_t threads, maxv, maxp, payload; } seen[32];
+        static volatile LONG nseen;
+        int known = 0;
+        LONG n = __atomic_load_n(&nseen, __ATOMIC_RELAXED);
+        for (int i = 0; i < n && i < 32 && !known; i++)
+            known = seen[i].threads == ctl->mesh_threads && seen[i].maxv == ctl->max_vertices &&
+                    seen[i].maxp == ctl->max_primitives && seen[i].payload == ctl->payload;
+        if (!known) {
+            LONG k = InterlockedIncrement(&nseen);
+            if (k <= 32) {
+                seen[k - 1].threads = ctl->mesh_threads, seen[k - 1].maxv = ctl->max_vertices;
+                seen[k - 1].maxp = ctl->max_primitives, seen[k - 1].payload = ctl->payload;
+                rt_log("gfx_shader: %s program: workgroup %u, max %u vertices, %u primitives, payload %u bytes",
+                       stage, ctl->mesh_threads, ctl->max_vertices, ctl->max_primitives, ctl->payload);
+            }
+        }
         /* Task and mesh (docs/mesh-tracker.md C1): the workgroup size (32 in every capture), the mesh limits and the
            VTG output map the translator turns into per-vertex output arrays. */
         o += sprintf(o, ",\"local\":[%u,1,1],\"maxv\":%u,\"maxp\":%u,\"payload\":%u,\"omap\":\"",

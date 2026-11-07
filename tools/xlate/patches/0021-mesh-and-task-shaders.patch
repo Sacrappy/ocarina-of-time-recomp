@@ -464,7 +464,8 @@
          /// <summary>
 --- /dev/null
 +++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMesh.cs
-@@ -0,0 +1,296 @@
+@@ -0,0 +1,317 @@
++using System;
 +using Ryujinx.Graphics.Shader.Decoders;
 +using Ryujinx.Graphics.Shader.IntermediateRepresentation;
 +using Ryujinx.Graphics.Shader.Translation;
@@ -652,16 +653,34 @@
 +            int lines = definitions.MeshOutputLines.Length;
 +            int groups = (definitions.MaxOutputVertices + 31) / 32;
 +
-+            for (int group = 0; group < groups; group++)
++            // The stage buffer holds `groups` groups of 32 vertices (docs/mesh.md): word (g * lines + line) * 32 + v.
++            // An invocation takes vertex v = its lane in the group, and (workgroup size / 32) groups at a time: the
++            // workgroup size is the control section's (32 in every capture, but Vulkan allows up to 128 invocations).
++            int workgroup = Math.Max(1, definitions.ComputeLocalSizeX);
++            int groupStep = Math.Max(1, workgroup / 32);
++            int iterations = (groups + groupStep - 1) / groupStep;
++            Operand lane = context.BitwiseAnd(threadId, Const(31));
++            Operand groupBase = context.ShiftRightU32(threadId, Const(5));
++
++            for (int iteration = 0; iteration < iterations; iteration++)
 +            {
-+                Operand vertex = group == 0 ? threadId : context.IAdd(threadId, Const(group * 32));
++                Operand group = iteration == 0 ? groupBase : context.IAdd(groupBase, Const(iteration * groupStep));
++                Operand vertex = context.IAdd(context.ShiftLeft(group, Const(5)), lane);
++
++                // A workgroup larger than the output needs (more invocations than groups * 32) leaves some lanes with
++                // no vertex: writing the last vertex twice would break Vulkan's one-invocation-per-vertex rule.
++                Operand lblOutOfRange = Label();
++                context.BranchIfFalse(lblOutOfRange,
++                                      context.ICompareLessUnsigned(vertex, Const(definitions.MaxOutputVertices)));
 +
 +                for (int line = 0; line < lines; line++)
 +                {
 +                    Operand word = context.Load(
 +                        StorageKind.SharedMemory,
 +                        stageId,
-+                        context.IAdd(Const((group * lines + line) * 32), threadId));
++                        context.IAdd(
++                            context.IMultiply(group, Const(lines * 32)),
++                            context.IAdd(Const(line * 32), lane)));
 +
 +                    MeshOutputLine output = definitions.MeshOutputLines[line];
 +
@@ -689,9 +708,11 @@
 +                            word);
 +                    }
 +                }
++
++                context.MarkLabel(lblOutOfRange);
 +            }
 +
-+            // Every lane takes the primitives it wrote: p = lane, lane + 32, ...
++            // Every lane takes the primitives it wrote: p = lane, lane + workgroup size, ...
 +            Operand primitive = Local();
 +            Operand lblHead = Label();
 +            Operand lblDone = Label();
@@ -716,7 +737,7 @@
 +
 +            context.MeshSetPrimitive(primitive, i0, i1, i2);
 +
-+            context.Copy(primitive, context.IAdd(primitive, Const(32)));
++            context.Copy(primitive, context.IAdd(primitive, Const(workgroup)));
 +            context.Branch(lblHead);
 +            context.MarkLabel(lblDone);
 +        }
@@ -748,7 +769,7 @@
 +
 +                context.MeshStorePayload(index, context.Load(StorageKind.SharedMemory, payloadId, index));
 +
-+                context.Copy(index, context.IAdd(index, Const(32)));
++                context.Copy(index, context.IAdd(index, Const(Math.Max(1, definitions.ComputeLocalSizeX))));
 +                context.Branch(lblHead);
 +                context.MarkLabel(lblDone);
 +            }
