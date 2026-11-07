@@ -2974,7 +2974,16 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     bind_resources(ex, info);
     twin_dispatch = 0;
     int tp = cst_begin(ex);
+    uint32_t op_pair = 0;
+    int op_timed = vk_gpu_op_begin(ex->cb, &op_pair);
     vkCmdDispatch(ex->cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
+    if (op_timed) {
+        char od[96];
+        const uint8_t *id = gfx_shader_input_id(cs);
+        snprintf(od, sizeof od, "dispatch %ux%ux%u cs %02x%02x%02x%02x", (unsigned)d->x, (unsigned)d->y,
+                 (unsigned)d->z, id[0], id[1], id[2], id[3]);
+        vk_gpu_op_end(ex->cb, op_pair, ex->fence, od);
+    }
     cst_end(ex, tp, cs, (const uint32_t[3]){(uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z});
     ex->recorded++;
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, d);
@@ -3060,7 +3069,15 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
         B.c0_valid[2] = 0;   // the range no longer holds B.c0[2]
     }
     ind_log(ex, &ip, cs);
+    uint32_t op_pair = 0;
+    int op_timed = vk_gpu_op_begin(ex->cb, &op_pair);
     vkCmdDispatchIndirect(ex->cb, ip.buffer, ip.offset);
+    if (op_timed) {
+        char od[96];
+        const uint8_t *id = gfx_shader_input_id(cs);
+        snprintf(od, sizeof od, "dispatch indirect cs %02x%02x%02x%02x", id[0], id[1], id[2], id[3]);
+        vk_gpu_op_end(ex->cb, op_pair, ex->fence, od);
+    }
     ex->recorded++;
     vk_mem_count(ip.cls, VK_MUSE_IND, sizeof(VkDispatchIndirectCommand));
     VK_MEM_BOUND(ip);

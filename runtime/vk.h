@@ -376,6 +376,9 @@ VkCommandBuffer vk_sync_split(void);
 // Runs fn(arg) on the completion thread once fence is done on the GPU (event writes, counter reports, sync state).
 // Callbacks run in the order they were added, after those of earlier values; a value already done runs at once there.
 void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg);
+// OOT_GPU_OPS=1 (diagnostic): a timestamp pair around one draw or dispatch; spans over OOT_GPU_OPS_MS are logged.
+int vk_gpu_op_begin(VkCommandBuffer cb, uint32_t *pair);
+void vk_gpu_op_end(VkCommandBuffer cb, uint32_t pair, uint64_t fence, const char *desc);
 // gfx_vulkan_backend (vk_backend.c): presents go to a present thread and run after the submissions made before them.
 void rdoc_init(void);                     // runtime/rdoc_win.c: OOT_RDOC debug capture; before vkCreateInstance
 int rdoc_active(void);

@@ -14,6 +14,7 @@
 // Side effects written after GPU completion, as MacNativeGames does: games/totk/third_party/d2r_gfx/gfx/nvn/hle_nvn.c:7-9
 // (https://github.com/ly05010419/MacNativeGames @ b75be8cfa704df3701e86130c8ced268e79d6b11, MIT, Copyright (c) 2026
 // jhaizhou; origin d2r-mobile).
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
@@ -148,6 +149,67 @@ static void ts_begin(VkCommandBuffer cb) { ts_cur = ts_open(cb); }
 static void ts_end(VkCommandBuffer cb, uint64_t fence) {
     ts_close(cb, ts_cur, fence);
     ts_cur = -1;
+}
+
+// ---- per-op GPU timing (OOT_GPU_OPS=1, diagnostic): the same timestamp pool around one draw or dispatch, so the
+// slowest ops of a frame can be named. The completion thread logs the spans over OOT_GPU_OPS_MS (default 2).
+#define OP_PAIRS 2048
+static VkQueryPool op_pool;
+static int op_state = -1;            // -1 not asked, 0 off, 1 on
+static uint32_t op_next;
+static double op_min_ms = 2.0;
+static volatile uint8_t op_busy[OP_PAIRS];
+typedef struct { uint32_t pair; char desc[96]; } OpTs;
+
+static void op_read_cb(void *arg) {
+    OpTs *t = arg;
+    VkCtx *c = vk_ctx();
+    uint64_t v[2];
+    if (vkGetQueryPoolResults(c->device, op_pool, 2 * t->pair, 2, sizeof v, v, sizeof v[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+        uint64_t s = v[0] & ts_mask, e = v[1] & ts_mask;
+        if (e >= s) {
+            double ms = (double)(e - s) * ts_period / 1e6;
+            if (ms >= op_min_ms) rt_log("vk: gpu op %.2f ms: %s", ms, t->desc);
+        }
+    }
+    __atomic_store_n(&op_busy[t->pair], 0, __ATOMIC_RELEASE);
+    free(t);
+}
+
+static int op_setup(void) {
+    if (op_state >= 0) return op_state == 1;
+    const char *e = getenv("OOT_GPU_OPS");
+    op_state = e && *e && atoi(e) ? 1 : 0;
+    if (!op_state) return 0;
+    VkCtx *c = vk_ctx();
+    if (ts_state != 1) ts_setup(c);
+    if (ts_state != 1) { op_state = 0; return 0; }
+    VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                                .queryCount = 2 * OP_PAIRS};
+    if (vkCreateQueryPool(c->device, &qi, NULL, &op_pool) != VK_SUCCESS) { op_state = 0; return 0; }
+    const char *m = getenv("OOT_GPU_OPS_MS");
+    if (m && *m) op_min_ms = atof(m);
+    rt_log("vk: per-op GPU timing on (spans over %.1f ms are logged)", op_min_ms);
+    return 1;
+}
+
+int vk_gpu_op_begin(VkCommandBuffer cb, uint32_t *pair) {
+    if (!op_setup()) return 0;
+    uint32_t p = op_next++ % OP_PAIRS;
+    if (__atomic_exchange_n(&op_busy[p], 1, __ATOMIC_ACQ_REL)) return 0;   // still in flight
+    vkCmdResetQueryPool(cb, op_pool, 2 * p, 2);
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, op_pool, 2 * p);
+    *pair = p;
+    return 1;
+}
+
+void vk_gpu_op_end(VkCommandBuffer cb, uint32_t pair, uint64_t fence, const char *desc) {
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, op_pool, 2 * pair + 1);
+    OpTs *t = calloc(1, sizeof *t);
+    if (!t) return;
+    t->pair = pair;
+    snprintf(t->desc, sizeof t->desc, "%s", desc);
+    vk_completion_add(fence, op_read_cb, t);
 }
 
 // An empty submission records no command buffer: its pair is never written.
