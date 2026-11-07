@@ -123,7 +123,10 @@ static unsigned pending_head;
 // report into guest memory. Slots come from one ring; the completion thread reads and host-resets them
 // (hostQueryReset, Vulkan 1.2), so the replay records no reset commands. A full ring (no slot read back yet) leaves the
 // draw uncounted and the segment's count at least 1, as does a query still unavailable after its fence. Without hostQueryReset the counts stay 0.
-#define OQ_N 4096
+// Lichii's OoT white-flash fix, in this back end's terms: the engine never lets a draw go uncounted. 4096 slots lasted
+// about six frames of the level's ~670-draw colour pass; the ring is now large enough that a report that comes a few
+// frames late does not silently lower the counter the game culls and exposes with.
+#define OQ_N 32768
 #define LOG_ONCE(...) do { static volatile char once_; if (!__atomic_exchange_n(&once_, 1, __ATOMIC_RELAXED)) rt_log(__VA_ARGS__); } while (0)
 static VkQueryPool oq_pool;
 static int oq_state;                     // 0 not set up, 1 counting available, -1 unavailable
@@ -138,6 +141,8 @@ static uint32_t *oq_seg;                 // replay: slots closed since the last 
 static uint32_t oq_nseg, oq_capseg;
 static int oq_lost;                      // replay: the segment missed a draw (ring full)
 static uint64_t oq_count;                // completion thread: samples since the last reset
+static uint64_t oq_reports_done, oq_last;  // completion thread: reports written, the last count (exit log)
+static uint64_t oq_resets, oq_drawn, oq_lost_draws;   // replay thread: counters for the exit log
 
 typedef struct { uint64_t addr; int reset, lost; uint32_t n; uint32_t q[]; } OqSegment;
 
@@ -185,8 +190,10 @@ void vk_exec_oq_draw(VkExec *ex) {
     if (__atomic_load_n(&oq_busy[q], __ATOMIC_ACQUIRE)) {
         warn_once(W_QUERY, "occlusion query ring full: draws left uncounted");
         oq_lost = 1;
+        oq_lost_draws++;
         return;
     }
+    oq_drawn++;
     oq_busy[q] = 1;
     oq_next++;
     vkCmdBeginQuery(ex->cb, oq_pool, q, oq_flags);
@@ -196,10 +203,20 @@ void vk_exec_oq_draw(VkExec *ex) {
 
 void vk_exec_oq_pass_end(VkExec *ex) { oq_close(ex); }
 
+// OOT_TRACE=gfx: whether this title uses samples-passed at all, how many draws it counted, and whether the ring ever
+// lost a draw. A title that never resets the counter cannot be affected by the query path.
+void vk_exec_oq_report_log(void) {
+    if (!oq_ready()) return;
+    rt_log("vk: samples passed: %llu resets, %llu draws counted, %llu lost (ring %d), %llu reports, last count %llu",
+           (unsigned long long)oq_resets, (unsigned long long)oq_drawn, (unsigned long long)oq_lost_draws, OQ_N,
+           (unsigned long long)oq_reports_done, (unsigned long long)oq_last);
+}
+
 void vk_exec_xfer_shutdown(void) {
     if (oq_state > 0) vkDestroyQueryPool(vk_ctx()->device, oq_pool, NULL);
     oq_pool = VK_NULL_HANDLE, oq_state = 0, oq_next = 0, oq_counting = oq_reported = oq_keep = 0, oq_open = -1;
     oq_nseg = 0, oq_lost = 0, oq_count = 0;
+    oq_reports_done = oq_last = oq_resets = oq_drawn = oq_lost_draws = 0;
     memset((void *)oq_busy, 0, sizeof oq_busy);
 }
 
@@ -234,6 +251,8 @@ static void oq_cb(void *arg) {
         oq_count += sum;
         if (s->lost && !oq_count) oq_count = 1;
         if (s->addr) write_counter(s->addr, oq_count);
+        oq_reports_done++;
+        oq_last = oq_count;
     }
     free(s);
 }
@@ -253,6 +272,7 @@ static void reset_counter(VkExec *ex, const p_reset_counter *p) {
     if (p->type != NVN_COUNTER_TYPE_SAMPLES_PASSED || !oq_ready()) return;
     oq_segment(ex, 0, 1);
     oq_counting = 1, oq_reported = 0;
+    oq_resets++;
 }
 
 // A samples-passed report: the segment goes with it (addr 0: no CPU-visible memory) and counting stops until the next

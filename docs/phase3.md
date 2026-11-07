@@ -534,3 +534,17 @@ Two different faults sit behind the white the player sees, and the frame dump no
   read of a report region served stale counts" fix (Lichii-1 `7ae3e74014`): confirm by dumping the same pass in a
   flash frame and a clean frame with the constant banks printed, then check whether a skipped kernel
   (`1a62084a`, `ace1cec0`) is the writer.
+
+## 2026-11-09: the loaded-save black screen is a NaN fog kernel
+
+A save loaded from the file-select screen renders a black 3D view with a working HUD, and a frame dump at present 2200
+shows why: the 2560x1440 HDR target is 100% NaN and a 1920x1080 lighting pass is all inf/-inf. The first NaN is written
+by the volumetric-fog light-injection dispatch `8c6c5bd19536f162`, whose input id is `1a62084a` ? the shader the
+gameplay runs have been skipping with `OOT_SKIP_CS` for speed. Skipping it (and zeroing the images it writes) removes
+every NaN and the village renders again, overexposed white. The black screen is therefore not a loading or save-path
+problem. The default profile also held no save slots (they were in `build/profile-save`), which is why a plain launch
+only offered a new game.
+
+The samples-passed counter is used heavily: ~43,000 resets and reports in a 956-frame run, most segments holding no
+draw, so the value the game reads is 0 or 1. The query ring grew from 4096 to 32768 slots so a late report no longer
+drops a draw, and the exit line now prints resets, counted draws, lost ones, reports and the last count.

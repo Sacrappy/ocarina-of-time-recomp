@@ -462,6 +462,7 @@ void rt_frame_presented(const tex_t *t, uint64_t n) {
     fflush(stderr);
     fs_save_flush();
     vk_pipeline_save();   // no-op without the Vulkan back end
+    vk_exec_oq_report_log();   // samples-passed: resets, counted draws, lost ones
     prof_write();
     fflush(stderr);
     _exit(0);

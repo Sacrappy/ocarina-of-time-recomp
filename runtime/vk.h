@@ -503,6 +503,7 @@ int vk_pipeline_set_indep(int on);
 typedef struct { uint64_t graphics, compute, failures, hits, layouts, push_layouts, async_built, pending_skips; } VkPipeStats;
 void vk_pipeline_stats(VkPipeStats *s);
 void vk_pipeline_save(void);               // writes the VkPipelineCache to pipeline-cache.bin next to oot.exe
+void vk_exec_oq_report_log(void);          // vk_exec_xfer.c: what the samples-passed path did this run
 void vk_pipeline_autosave(void);           // vk_pipeline_save at most every 20 s, when pipelines were built since
 void vk_pipeline_shutdown(void);           // waits for background builds, saves, destroys pipelines, layouts and the
                                            // cache; before vk_shutdown
