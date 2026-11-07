@@ -52,6 +52,12 @@ int sm86_control_parse(const uint8_t *control, uint32_t control_size, Sm86Contro
     memcpy(&c->code_size, control + 0x44, 4);
     c->stage = control[0x56];
     memcpy(c->local, control + 0x58, 12);
+    // Task and mesh (docs/mesh.md, A4): +0x58 low 16 bits the threads per workgroup, its top byte the payload in KiB;
+    // +0x60 the maximum vertices (low 16) and primitives (high 16).
+    c->mesh_threads = control[0x58] | (uint32_t)control[0x59] << 8;
+    c->payload = (uint32_t)control[0x5f] * 1024;
+    memcpy(&c->max_vertices, control + 0x60, 4);
+    c->max_primitives = c->max_vertices >> 16, c->max_vertices &= 0xffff;
     if (c->size < SM86_CONTROL_MIN || c->size > control_size) c->size = SM86_CONTROL_MIN;
     uint32_t header = c->stage == 5 ? 0 : SM86_HEADER;
     if (c->stage > 7 || c->code_end <= header || c->code_end % 16 || c->c1_off < c->code_end ||

@@ -9,10 +9,11 @@
 //   oot_xlate --serve              one request per stdin line: {"job": {...}, "out": "<dir>"}; one reply line per request:
 //                                   "ok <key>" or "fail <key> <message>"; a malformed line gets "fail ? <message>" and the loop continues.
 //   oot_xlate <jobs.json> <outdir> batch mode: a JSON array of jobs, prints a summary, exit 1 if any failed.
-//   job: { "key", "stage": "vs|ps|cs", "code": path (graphics = 0x50-byte SPH + instructions, compute = instructions), "c1": hex,
+//   job: { "key", "stage": "vs|ps|cs|ts|ms", "code": path (graphics, task and mesh = 0x50-byte SPH + instructions, compute = instructions), "c1": hex,
 //          "tex": {slot: type}, "img": {slot: {type, fmt}}, "attr": {loc: float|sint|uint}, "fout": {idx: float|sint|uint},
 //          "local": [x, y, z], "shared": bytes, "debug": bool, "reduced": bool, "softfloat64": bool,
-//          "sbuf_align": int, "subgroup": int }
+//          "sbuf_align": int, "subgroup": int,
+//          "maxv": int, "maxp": int, "payload": bytes, "omap": hex }   // task/mesh: mesh limits and the VTG output map
 //   Output: <out>/<key>.spv and <out>/<key>.res.json (bindings, queried slots, notes).
 using Ryujinx.Common.Memory;
 using Ryujinx.Graphics.Shader;
@@ -119,6 +120,15 @@ static class SwshXlate
             return Enum.TryParse(f, true, out TextureFormat tf) ? tf : TextureFormat.R8G8B8A8Unorm;
         }
         int Local(int i) => _job["local"] is JsonArray a && a.Count > i ? (int)a[i] : 1;
+        // Task and mesh jobs (docs/mesh.md): the stage, the workgroup size in "local", and the fields the host read
+        // from the control section and the code header's VTG output map.
+        public bool QueryIsMeshTaskStage() => _job["stage"] is JsonNode n && (string)n is "ts" or "ms";
+        public bool QueryIsMeshStage() => _job["stage"] is JsonNode n && (string)n == "ms";
+        public int QueryMeshMaxVertices() => _job["maxv"] is JsonNode v ? (int)v : 0;
+        public int QueryMeshMaxPrimitives() => _job["maxp"] is JsonNode p ? (int)p : 0;
+        public int QueryMeshPayloadSize() => _job["payload"] is JsonNode q ? (int)q : 0;
+        public ReadOnlySpan<byte> QueryMeshOutputMap() =>
+            _job["omap"] is JsonNode h ? Convert.FromHexString((string)h) : ReadOnlySpan<byte>.Empty;
         public int QueryComputeLocalSizeX() => Local(0);
         public int QueryComputeLocalSizeY() => Local(1);
         public int QueryComputeLocalSizeZ() => Local(2);
@@ -168,7 +178,10 @@ static class SwshXlate
                 var acc = new Accessor(code, job);
                 // 作业 debug = false：关 DebugMode（DebugMode 会跳过 AST 优化器，产物满是临时变量；不改语义）
                 // Job debug = false: turn off DebugMode (DebugMode skips the AST optimizer and the output is full of temporaries; semantics unchanged)
-                var flags = (job["debug"] is JsonNode dbg && !(bool)dbg ? 0 : TranslationFlags.DebugMode) | ((string)job["stage"] == "cs" ? TranslationFlags.Compute : 0);
+                string stage = (string)job["stage"];
+                var flags = (job["debug"] is JsonNode dbg && !(bool)dbg ? 0 : TranslationFlags.DebugMode) |
+                            (stage == "cs" ? TranslationFlags.Compute : 0) |
+                            (stage is "ts" or "ms" ? TranslationFlags.MeshShader : 0);
                 var ctx = Translator.CreateContext(0, acc, new TranslationOptions(TargetLanguage.Spirv, TargetApi.Vulkan, flags));
                 ShaderProgram p = ctx.Translate();
                 File.WriteAllBytes(Path.Combine(outDir, key + ".spv"), p.BinaryCode);
@@ -189,7 +202,16 @@ static class SwshXlate
                 File.WriteAllText(Path.Combine(outDir, key + ".res.json"), res.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
                 return null;
             }
-            catch (Exception e) { if (Environment.GetEnvironmentVariable("DMSH_STACK") != null) Console.Error.WriteLine(e.StackTrace); return $"{e.GetType().Name}: {e.Message.Split('\n')[0]}"; }
+            catch (Exception e)
+            {
+                // DMSH_STACK=1 names the failing frame in the reply too (the service's stderr is not always visible):
+                // one line, since the host reads one reply line per request.
+                string msg = $"{e.GetType().Name}: {e.Message.Split('\n')[0]}";
+                if (Environment.GetEnvironmentVariable("DMSH_STACK") != null && e.StackTrace != null)
+                    msg += " @ " + e.StackTrace.Replace('\n', ' ').Replace("\r", "");
+
+                return msg;
+            }
     }
 
     static int Main(string[] args)

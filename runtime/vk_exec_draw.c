@@ -40,6 +40,8 @@
 #define NVN_STAGE_VS 0
 #define NVN_STAGE_FS 1
 #define NVN_STAGE_CS 5
+#define NVN_STAGE_TS 6
+#define NVN_STAGE_MS 7
 #define ONESHOT_WAIT_MS 30000u   // prepare_draw: how long a one-shot draw waits for its pipeline before it is skipped
 
 enum { W_PROGRAM, W_SHADER, W_PIPELINE, W_NO_VS, W_INDEX, W_UB, W_BIND, W_SSBO_ALIGN, W_SSBO_SLOT, W_RESTART, W_INDIRECT, W_COUNT };
@@ -617,7 +619,7 @@ typedef struct { uint64_t serial; int stage; int used; GfxShaderAnswers a; const
 static ShaderEnt shader_tab[SHADER_SETS][SHADER_WAYS];
 
 // OoT: NVN2 control sections (sm86_lower.h): the stage at byte +0x56, the code block's size at +0x44.
-static const GfxShader *C1CUR[6];                           // the shader shader_for last resolved per NVN stage
+static const GfxShader *C1CUR[8];                           // the shader shader_for last resolved per NVN stage
 
 static int find_stage_scan(const prog_t *p, int nvn_stage, const uint8_t **ctl, const uint8_t **code, uint32_t *len) {
     for (uint32_t i = 0; i < p->nstage && i < 6; i++) {
@@ -659,7 +661,7 @@ int vk_exec_find_stage(const prog_t *p, int nvn_stage, const uint8_t **ctl, cons
 // Texture and image types of a stage's first 32 slots, each kept with the handle and the generation and slot token it
 // was looked up under: a slot is looked up again, a hash probe, only when the handle changed or its slot may resolve
 // otherwise (slot_still).
-static struct { uint64_t tex[32], img[32], ttok[32], itok[32]; uint32_t tgen[32], igen[32]; uint8_t tt[32], it[32]; } AC[6];
+static struct { uint64_t tex[32], img[32], ttok[32], itok[32]; uint32_t tgen[32], igen[32]; uint8_t tt[32], it[32]; } AC[8];
 
 // vk_texture_slot_token of the slot a texture or image handle names; an empty handle always resolves to nothing.
 static uint64_t token_of(uint64_t h) { return h ? vk_texture_slot_token((int)(h & 0xfffff)) : 1; }
@@ -809,7 +811,8 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
             return C1CUR[st] = set[0].s;
         }
     }
-    int gs = st == NVN_STAGE_VS ? GFX_STAGE_VS : st == NVN_STAGE_FS ? GFX_STAGE_FS : GFX_STAGE_CS;
+    int gs = st == NVN_STAGE_VS ? GFX_STAGE_VS : st == NVN_STAGE_FS ? GFX_STAGE_FS
+           : st == NVN_STAGE_TS ? GFX_STAGE_TS : st == NVN_STAGE_MS ? GFX_STAGE_MS : GFX_STAGE_CS;
     const GfxShader *s = await ? gfx_shader_await(gs, ctl, code, len, &a)
                        : pending && vk_pipeline_async_on() ? gfx_shader_get_async(gs, ctl, code, len, &a, pending)
                                                            : gfx_shader_get(gs, ctl, code, len, NULL, &a);
@@ -827,7 +830,8 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
 // ---- descriptors
 
 static int nvn_stage_of(int gfx_stage) {
-    return gfx_stage == GFX_STAGE_VS ? NVN_STAGE_VS : gfx_stage == GFX_STAGE_FS ? NVN_STAGE_FS : NVN_STAGE_CS;
+    return gfx_stage == GFX_STAGE_VS ? NVN_STAGE_VS : gfx_stage == GFX_STAGE_FS ? NVN_STAGE_FS
+         : gfx_stage == GFX_STAGE_TS ? NVN_STAGE_TS : gfx_stage == GFX_STAGE_MS ? NVN_STAGE_MS : NVN_STAGE_CS;
 }
 
 static VkDescriptorBufferInfo zero_info(uint64_t max) {
@@ -3096,22 +3100,126 @@ static void ind_log(VkExec *ex, const VkMemSpan *ip, const GfxShader *cs) {
 
 // DispatchComputeIndirect: vkCmdDispatchIndirect from the pool buffer. The shader reads the group counts from c0 0x200,
 // so they are copied there on the GPU, into a c0 range no other dispatch uses, before the dispatch.
-// Mesh tasks (docs/mesh.md, docs/mesh-tracker.md D3): recorded, not drawn yet. Counted (logged at powers of two from
-// 256) and noted in a frame dump with the bound program and the pass they fall in, so a dump shows where the scene's
-// mesh-shader geometry goes.
-static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d) {
-    static volatile LONG direct, indirect;
-    LONG k = InterlockedIncrement(d->ind ? &indirect : &direct);
-    if (k >= 256 && !(k & (k - 1)))
-        rt_log("vk_exec: %ld %s mesh-task draws met, none drawn yet", (long)k, d->ind ? "indirect" : "direct");
-    if (d->ind)
-        vk_dump_note("mesh draw skipped (not replayed yet): indirect record at %#llx, program %llu, %s pass %ux%u",
-                     (unsigned long long)d->ind, ex->prog ? (unsigned long long)ex->prog->serial : 0ull,
-                     ex->in_pass ? "in" : "outside a", ex->pass_w, ex->pass_h);
-    else
-        vk_dump_note("mesh draw skipped (not replayed yet): workgroups %u from %u, program %llu, %s pass %ux%u", d->count,
-                     d->first, ex->prog ? (unsigned long long)ex->prog->serial : 0ull, ex->in_pass ? "in" : "outside a",
+// Mesh tasks (docs/mesh.md, docs/mesh-tracker.md D3): the bound program's mesh (and task, when it has one) stage
+// replaces the vertex stage, and the draw becomes vkCmdDrawMeshTasksEXT / ...IndirectEXT. The indirect record is the
+// 16-byte {countX, countY, countZ, pad} block the game writes on the GPU.
+static PFN_vkCmdDrawMeshTasksEXT mesh_draw_fn;
+static PFN_vkCmdDrawMeshTasksIndirectEXT mesh_draw_indirect_fn;
+static int mesh_fns(void) {
+    static int tried, ok;
+    if (tried) return ok;
+    tried = 1;
+    VkDevice dev = vk_ctx()->device;
+    if (vk_ctx()->has_mesh_shader) {
+        mesh_draw_fn = (PFN_vkCmdDrawMeshTasksEXT)vkGetDeviceProcAddr(dev, "vkCmdDrawMeshTasksEXT");
+        mesh_draw_indirect_fn = (PFN_vkCmdDrawMeshTasksIndirectEXT)vkGetDeviceProcAddr(dev, "vkCmdDrawMeshTasksIndirectEXT");
+        ok = mesh_draw_fn && mesh_draw_indirect_fn;
+    }
+    if (!ok)
+        rt_log("vk_exec: mesh draws are not replayed: %s", vk_ctx()->has_mesh_shader
+               ? "the device is missing the entry points" : "the device has no VK_EXT_mesh_shader");
+    return ok;
+}
+
+// A mesh draw's state: the pass, the program's mesh (and task) stage and its fragment stage, the pipeline and the
+// resources. No vertex input and no index buffer; the mesh shader writes its own vertex and primitive outputs.
+static int prepare_mesh(VkExec *ex) {
+    if (ex->render_disabled) return 0;
+    cb_res(ex);
+    dummies_init();
+    if (ex->pass_noatt) {
+        uint32_t w, h;
+        vk_exec_noatt_dims(ex, &w, &h);
+        if (ex->in_pass && (w > ex->pass_w || h > ex->pass_h)) vk_exec_pass_end(ex);
+        if (!ex->in_pass) ex->rt_resolved = 0;
+    }
+    if (!ex->in_pass) ex->dirty |= VK_EXEC_DIRTY_VIEWPORT | VK_EXEC_DIRTY_SCISSOR;
+    vk_exec_pass_begin(ex);
+    VkRect2D sc = vk_exec_scissor(ex);
+    if (!sc.extent.width || !sc.extent.height) return 0;
+
+    int has_ms, has_ts, has_fs, ms_wait = 0, ts_wait = 0, fs_wait = 0;
+    const GfxShader *ms = shader_for(ex, NVN_STAGE_MS, &has_ms, &ms_wait, 0);
+    const GfxShader *ts = shader_for(ex, NVN_STAGE_TS, &has_ts, &ts_wait, 0);
+    const GfxShader *fs = shader_for(ex, NVN_STAGE_FS, &has_fs, &fs_wait, 0);
+    if (!has_ms) return warn_once(W_NO_VS, "a mesh draw with a program that has no mesh stage is skipped"), 0;
+    if (ms_wait || ts_wait || fs_wait) {
+        if (!vk_exec_targets_recent(ex, 0)) return perf_count(PERF_CNT_SHADER_SKIP), 0;
+        perf_count(PERF_CNT_ONESHOT_WAIT);
+        if (ms_wait) ms = shader_for(ex, NVN_STAGE_MS, &has_ms, NULL, 1);
+        if (ts_wait) ts = shader_for(ex, NVN_STAGE_TS, &has_ts, NULL, 1);
+        if (fs_wait) fs = shader_for(ex, NVN_STAGE_FS, &has_fs, NULL, 1);
+    }
+    if (!ms || (has_ts && !ts) || (has_fs && !fs)) {
+        if (vk_dump_armed)
+            vk_dump_note("mesh draw skipped: %s stage missing, program %llu, pass %ux%u",
+                         !ms ? "mesh" : has_ts && !ts ? "task" : "fragment",
+                         ex->prog ? (unsigned long long)ex->prog->serial : 0ull, ex->pass_w, ex->pass_h);
+        return 0;
+    }
+
+    uint32_t fbl = fs ? feedback_prepare(ex, fs) : 0;
+    VkPipeState s = ex->pipe;
+    s.vs = NULL;
+    s.ts = has_ts ? ts : NULL;
+    s.mesh = ms;
+    s.fs = fs;
+    s.feedback = (uint8_t)((fbl & 0xff ? 1 : 0) | (fbl & 0x100 ? 2 : 0));
+    s.prim = NVN_DRAW_PRIMITIVE_TRIANGLES;   // the mesh shader's own output topology is triangles
+    s.depth_minus_w = (uint8_t)(nvn_depth_minus_w() != 0);
+    s.y_flip = 1;
+    s.prim_restart = 0;
+    s.xfb = 0;
+
+    const VkPipeInfo *info = NULL;
+    int pending = 0;
+    VkPipeline p = vk_pipeline_graphics_async(&s, &info, &pending, 0);
+    if (pending || !p || !info) {
+        if (!p && !pending) warn_once(W_PIPELINE, "a task/mesh pipeline could not be created: mesh draws with it are skipped");
+        return 0;
+    }
+    bind_pipeline(ex, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+    if (!B.st_valid || memcmp(&B.st, &s, sizeof s)) {
+        vk_pipeline_set_dynamic(ex->cb, &s);
+        ex->recorded++;
+        B.st = s, B.st_valid = 1;
+    }
+    record_fixed(ex);
+    bind_resources(ex, info);
+    if (fbl & ex->fb_dirty) feedback_barrier(ex);
+    feedback_written(ex, &s);
+    if (vk_dump_armed) {
+        char hm[17] = "-", hf[17] = "-";
+        for (int k = 0; k < 8; k++) snprintf(hm + 2 * k, 3, "%02x", gfx_shader_input_id(ms)[k]);
+        if (fs) for (int k = 0; k < 8; k++) snprintf(hf + 2 * k, 3, "%02x", gfx_shader_input_id(fs)[k]);
+        vk_dump_note("mesh draw: mesh %s%s, fragment %s, program %llu, %s pass %ux%u", hm, has_ts ? " (task)" : "", hf,
+                     ex->prog ? (unsigned long long)ex->prog->serial : 0ull, ex->in_pass ? "in" : "outside a",
                      ex->pass_w, ex->pass_h);
+    }
+    vk_exec_oq_draw(ex);
+    return 1;
+}
+
+static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d) {
+    if (!ex->prog) return warn_once(W_PROGRAM, "a mesh draw without a bound program is skipped");
+    if (!mesh_fns() || !prepare_mesh(ex)) return;
+    if (d->ind) {
+        VkMemSpan ip;
+        if (!vk_mem_resolve(d->ind, 16, &ip) || ip.offset % 4)
+            return warn_once(W_INDIRECT, "mesh task arguments at %#llx are not backed or not aligned: skipped",
+                             (unsigned long long)d->ind);
+        VK_MEM_USE(ip);
+        mesh_draw_indirect_fn(ex->cb, ip.buffer, ip.offset, 1, 16);
+        ex->recorded++;
+    } else {
+        if (d->first) {
+            static int said;
+            if (said++ < 4) rt_log("vk_exec: a mesh draw starts at workgroup %u; Vulkan has no first workgroup, its ids start at 0", d->first);
+        }
+        mesh_draw_fn(ex->cb, d->count ? d->count : 1, 1, 1);
+        ex->recorded++;
+    }
+    vk_exec_frame.draws++;
 }
 
 static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
@@ -3203,7 +3311,7 @@ static uint64_t pool_handle(const VkExec *ex, uint64_t h, int kind) {
 }
 
 static void bind_handles(const VkExec *ex, uint64_t *dst, int cap, const p_bind_handles *b, int kind) {
-    if (b->stage < 0 || b->stage >= 6 || b->first < 0 || b->n < 0 || b->n > 32 || b->first + b->n > cap) {
+    if (b->stage < 0 || b->stage >= 8 || b->first < 0 || b->n < 0 || b->n > 32 || b->first + b->n > cap) {
         warn_once(W_BIND, "a bind of %d handles at %d of stage %d is out of range: ignored", b->n, b->first, b->stage);
         return;
     }
@@ -3266,9 +3374,11 @@ static const prog_t *combined_program(const prog_t *const sp[6]) {
 }
 
 static void bind_program(VkExec *ex, const p_bind_program *b) {
-    for (int st = 0; st < 6; st++)
+    for (int st = 0; st < 8; st++)
         if (b->stages & (1 << st)) ex->stage_prog[st] = b->prog;
-    ex->prog = combined_program(ex->stage_prog), ex->prog_stages = b->stages;
+    // A task or mesh program serves its own stages (there is no separable bind for them): use the program as bound.
+    ex->prog = b->stages & (3u << 6) ? (const prog_t *)b->prog : combined_program(ex->stage_prog);
+    ex->prog_stages = b->stages;
 }
 
 void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
@@ -3317,31 +3427,31 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     }
     case OP_BIND_UBO: {
         const p_bind_buf *b = payload;
-        if (b->stage >= 0 && b->stage < 6 && b->index >= 0 && b->index < 18) ex->ubo[b->stage][b->index] = *b;
+        if (b->stage >= 0 && b->stage < 8 && b->index >= 0 && b->index < 18) ex->ubo[b->stage][b->index] = *b;
         bind_gen++;
         break;
     }
     case OP_BIND_SSBO: {
         const p_bind_buf *b = payload;
-        if (b->stage >= 0 && b->stage < 6 && b->index >= 0 && b->index < 16) ex->ssbo[b->stage][b->index] = *b;
+        if (b->stage >= 0 && b->stage < 8 && b->index >= 0 && b->index < 16) ex->ssbo[b->stage][b->index] = *b;
         bind_gen++;
         break;
     }
     case OP_BIND_TEX: {
         const p_bind_handles *b = payload;
-        bind_handles(ex, b->stage >= 0 && b->stage < 6 ? ex->tex[b->stage] : NULL, 128, b, 0);
+        bind_handles(ex, b->stage >= 0 && b->stage < 8 ? ex->tex[b->stage] : NULL, 128, b, 0);
         ex->tex_serial++;
         bind_gen++;
         break;
     }
     case OP_BIND_SAMP: {
         const p_bind_handles *b = payload;
-        bind_handles(ex, b->stage >= 0 && b->stage < 6 ? ex->samp[b->stage] : NULL, 128, b, 1);
+        bind_handles(ex, b->stage >= 0 && b->stage < 8 ? ex->samp[b->stage] : NULL, 128, b, 1);
         break;
     }
     case OP_BIND_IMG: {
         const p_bind_handles *b = payload;
-        bind_handles(ex, b->stage >= 0 && b->stage < 6 ? ex->img[b->stage] : NULL, 32, b, 2);
+        bind_handles(ex, b->stage >= 0 && b->stage < 8 ? ex->img[b->stage] : NULL, 32, b, 2);
         ex->tex_serial++;   // the shader memo's handle check (feedback_scan reads only textures: a rescan at most)
         bind_gen++;
         break;

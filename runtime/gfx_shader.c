@@ -570,7 +570,8 @@ static int reflection_valid(const char *res, uint64_t size) {
     const char *st = strstr(b, "\"stage\"");
     if (!st) return 0;
     st = strchr(st + 7, '"');
-    return st && (!strncmp(st, "\"vs\"", 4) || !strncmp(st, "\"ps\"", 4) || !strncmp(st, "\"cs\"", 4));
+    return st && (!strncmp(st, "\"vs\"", 4) || !strncmp(st, "\"ps\"", 4) || !strncmp(st, "\"cs\"", 4) ||
+                   !strncmp(st, "\"ts\"", 4) || !strncmp(st, "\"ms\"", 4));
 }
 
 // Every instruction after the header has a word count and the last one ends at the module's end: a module with
@@ -939,7 +940,8 @@ static void reflect(GfxShader *s) {
     const char *js = s->reflection;
     char stage[8];
     json_str(js, js + strlen(js), "stage", stage, sizeof stage);
-    s->stage = !strcmp(stage, "cs") ? GFX_STAGE_CS : !strcmp(stage, "ps") ? GFX_STAGE_FS : GFX_STAGE_VS;
+    s->stage = !strcmp(stage, "cs") ? GFX_STAGE_CS : !strcmp(stage, "ps") ? GFX_STAGE_FS
+             : !strcmp(stage, "ts") ? GFX_STAGE_TS : !strcmp(stage, "ms") ? GFX_STAGE_MS : GFX_STAGE_VS;
     for (int k = 0; k < GFX_RES_KINDS; k++) {
         int count = json_objects(js, kinds[k], NULL, s, k);
         s->res[k] = calloc(count ? count : 1, sizeof *s->res[k]);
@@ -1231,7 +1233,7 @@ static void build_key(const uint8_t code_hash[32], const GfxShaderAnswers *a, co
 }
 
 static size_t build_request(char *o0, const char *hex, const char *stage, const char *code_path, const uint8_t *c1,
-                            uint32_t c1_len, const GfxShaderAnswers *a, const Sm86Control *ctl) {
+                            uint32_t c1_len, const GfxShaderAnswers *a, const Sm86Control *ctl, const uint8_t *code) {
     char *o = o0;
     o += sprintf(o, "{\"job\":{\"key\":\"");
     json_esc(&o, hex);
@@ -1274,6 +1276,14 @@ static size_t build_request(char *o0, const char *hex, const char *stage, const 
         if (a && (a->local[0] | a->local[1] | a->local[2])) l[0] = a->local[0], l[1] = a->local[1], l[2] = a->local[2];
         else for (int k = 0; k < 3; k++) l[k] = ctl->local[k] ? ctl->local[k] : 1;
         o += sprintf(o, ",\"local\":[%u,%u,%u]", l[0], l[1], l[2]);
+    }
+    if (!strcmp(stage, "ts") || !strcmp(stage, "ms")) {
+        /* Task and mesh (docs/mesh-tracker.md C1): the workgroup size (32 in every capture), the mesh limits and the
+           VTG output map the translator turns into per-vertex output arrays. */
+        o += sprintf(o, ",\"local\":[%u,1,1],\"maxv\":%u,\"maxp\":%u,\"payload\":%u,\"omap\":\"",
+                     ctl->mesh_threads ? ctl->mesh_threads : 32u, ctl->max_vertices, ctl->max_primitives, ctl->payload);
+        for (int i = 0; i < 16; i++) o += sprintf(o, "%02x", code[0x34 + i]);
+        o += sprintf(o, "\"");
     }
     /* Switch 1's control byte +0x718 bit 0 was the driver's early-Z-force (MacNativeGames ae8f4f4: without it a
        shader that stores to memory is depth-tested late, and the G-buffer draws' EQUAL test after the depth prepass
@@ -1350,7 +1360,8 @@ typedef struct {
 static int req_init(Req *r, int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size, const uint8_t *c1,
                     const GfxShaderAnswers *a) {
     (void)c1;
-    r->stage_name = stage == GFX_STAGE_VS ? "vs" : stage == GFX_STAGE_FS ? "ps" : stage == GFX_STAGE_CS ? "cs" : NULL;
+    r->stage_name = stage == GFX_STAGE_VS ? "vs" : stage == GFX_STAGE_FS ? "ps" : stage == GFX_STAGE_CS ? "cs"
+                  : stage == GFX_STAGE_TS ? "ts" : stage == GFX_STAGE_MS ? "ms" : NULL;
     if (!r->stage_name) return fail("stage is not translated", NULL), 0;
     if (!control || !sm86_control_parse(control, CONTROL_BOUND, &r->ctl)) return fail("bad control section", NULL), 0;
     r->length = r->ctl.code_size;
@@ -1517,7 +1528,7 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
     size_t cap = 2 * PATH_CAP * 6 + 2 * (size_t)low.c1_len + 8192;
     char *req = malloc(cap), reply[LINE_MAX_LEN];
     if (!req) return sm86_lower_free(&low), plat_file_delete(code_path), fail("out of memory", hex);
-    build_request(req, hex, r->stage_name, code_path, low.c1, low.c1_len, a, &r->ctl);
+    build_request(req, hex, r->stage_name, code_path, low.c1, low.c1_len, a, &r->ctl, code);
     sm86_lower_free(&low);
     int ok = svc_request(req, reply, sizeof reply);
     free(req);

@@ -1,0 +1,1277 @@
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/CodeGenContext.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/CodeGenContext.cs
+@@ -41,6 +41,17 @@
+         public Dictionary<IoDefinition, Instruction> InputsPerPatch { get; } = new();
+         public Dictionary<IoDefinition, Instruction> OutputsPerPatch { get; } = new();
+ 
++        // Task and mesh stages: the payload the two stages of a pipeline share, the mesh's primitive indices, and
++        // the variables that are part of the entry point's interface but not of the Inputs/Outputs dictionaries.
++        public Instruction TaskPayload { get; set; }
++        public Instruction PrimitiveTriangleIndices { get; set; }
++        private readonly List<Instruction> _extraInterface = new();
++
++        public void AddInterface(Instruction variable)
++        {
++            _extraInterface.Add(variable);
++        }
++
+         // MP4 (2026-11-04): a fragment shader that indexes its inputs reads them from a private copy (IndexedInputCopy),
+         // filled at the start of main from one input variable per location (IndexedInputs), each with its own
+         // interpolation (Declarations.DeclareIndexedFragmentInputs).
+@@ -94,7 +105,9 @@
+             StructuredProgramInfo info,
+             CodeGenParameters parameters,
+             GeneratorPool<Instruction> instPool,
+-            GeneratorPool<LiteralInteger> integerPool) : base(SpirvVersionPacked, instPool, integerPool)
++            GeneratorPool<LiteralInteger> integerPool)
++            // SPV_EXT_mesh_shader requires SPIR-V 1.4 or later (Vulkan 1.2+ accepts 1.5 on every desktop driver).
++            : base(parameters.Definitions.Stage.IsMeshOrTask ? (1u << 16 | 4u << 8) : SpirvVersionPacked, instPool, integerPool)
+         {
+             WasNonUniformAccessDeclared = false;
+ 
+@@ -165,6 +178,20 @@
+             foreach ((int _, Instruction variable) in IndexedInputs)
+             {
+                 mainInterface.Add(variable);
++            }
++
++            mainInterface.AddRange(_extraInterface);
++
++            if (Definitions.Stage.IsMeshOrTask)
++            {
++                // SPIR-V 1.4 (SPV_EXT_mesh_shader) requires every global variable the entry point uses in its interface.
++                foreach (Instruction global in GlobalVariables)
++                {
++                    if (!mainInterface.Contains(global))
++                    {
++                        mainInterface.Add(global);
++                    }
++                }
+             }
+ 
+             return mainInterface.ToArray();
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
+@@ -125,9 +125,13 @@
+ 
+                 SpvInstruction structType = context.TypeStruct(false, structFieldTypes);
+ 
++                // SPIR-V 1.4 (needed by SPV_EXT_mesh_shader) has no BufferBlock: a storage buffer is a Block struct
++                // in the StorageBuffer class.
++                bool storageBufferClass = isBuffer && context.Definitions.Stage.IsMeshOrTask;
++
+                 if (decoratedTypes.Add(structType))
+                 {
+-                    context.Decorate(structType, isBuffer ? Decoration.BufferBlock : Decoration.Block);
++                    context.Decorate(structType, isBuffer && !storageBufferClass ? Decoration.BufferBlock : Decoration.Block);
+ 
+                     for (int fieldIndex = 0; fieldIndex < structFieldOffsets.Length; fieldIndex++)
+                     {
+@@ -135,8 +139,10 @@
+                     }
+                 }
+ 
+-                SpvInstruction pointerType = context.TypePointer(StorageClass.Uniform, structType);
+-                SpvInstruction variable = context.Variable(pointerType, StorageClass.Uniform);
++                StorageClass bufferClass = storageBufferClass ? StorageClass.StorageBuffer : StorageClass.Uniform;
++
++                SpvInstruction pointerType = context.TypePointer(bufferClass, structType);
++                SpvInstruction variable = context.Variable(pointerType, bufferClass);
+ 
+                 context.Name(variable, buffer.Name);
+                 context.Decorate(variable, Decoration.DescriptorSet, (LiteralInteger)setIndex);
+@@ -409,13 +415,53 @@
+             }
+ 
+             DeclarePerVertexBlock(context);
++            DeclareMeshStage(context);
++        }
++
++        // SPV_EXT_mesh_shader: the mesh's primitive indices, and the task payload the two stages of a pipeline share.
++        private static void DeclareMeshStage(CodeGenContext context)
++        {
++            ShaderDefinitions definitions = context.Definitions;
++
++            if (definitions.Stage == ShaderStage.Mesh && definitions.MaxMeshOutputPrimitives > 0)
++            {
++                SpvInstruction uvec3 = context.TypeVector(context.TypeU32(), 3);
++                SpvInstruction arrayType = context.TypeArray(uvec3, context.Constant(context.TypeU32(), definitions.MaxMeshOutputPrimitives));
++                SpvInstruction pointerType = context.TypePointer(StorageClass.Output, arrayType);
++                SpvInstruction variable = context.Variable(pointerType, StorageClass.Output);
++
++                context.Name(variable, "gl_PrimitiveTriangleIndicesEXT");
++                context.Decorate(variable, Decoration.BuiltIn, (LiteralInteger)BuiltIn.PrimitiveTriangleIndicesEXT);
++                context.AddGlobalVariable(variable);
++                context.AddInterface(variable);
++                context.PrimitiveTriangleIndices = variable;
++            }
++
++            // A task stage always has a payload variable (OpEmitMeshTasksEXT names one); a mesh stage of a task
++            // pipeline needs it to read what the task wrote.
++            if (definitions.Stage == ShaderStage.Task ||
++                (definitions.Stage == ShaderStage.Mesh && definitions.MeshPayloadSize > 0))
++            {
++                int words = Math.Max(1, (definitions.MeshPayloadSize + 3) / 4);
++                SpvInstruction arrayType = context.TypeArray(context.TypeU32(), context.Constant(context.TypeU32(), words));
++                SpvInstruction structType = context.TypeStruct(false, arrayType);
++
++                context.Decorate(structType, Decoration.Block);
++
++                SpvInstruction pointerType = context.TypePointer(StorageClass.TaskPayloadWorkgroupEXT, structType);
++                SpvInstruction variable = context.Variable(pointerType, StorageClass.TaskPayloadWorkgroupEXT);
++
++                context.Name(variable, "mesh_payload");
++                context.AddGlobalVariable(variable);
++                context.TaskPayload = variable;
++            }
+         }
+ 
+         private static void DeclarePerVertexBlock(CodeGenContext context)
+         {
+-            if (context.Definitions.Stage.IsVtg)
+-            {
+-                if (context.Definitions.Stage != ShaderStage.Vertex)
++            if (context.Definitions.Stage.IsVtg || context.Definitions.Stage == ShaderStage.Mesh)
++            {
++                if (context.Definitions.Stage is not (ShaderStage.Vertex or ShaderStage.Mesh))
+                 {
+                     SpvInstruction perVertexInputStructType = CreatePerVertexStructType(context);
+                     int arraySize = context.Definitions.Stage == ShaderStage.Geometry ? context.Definitions.InputTopology.InputVertexCount : 32;
+@@ -460,6 +506,11 @@
+                 if (context.Definitions.Stage == ShaderStage.TessellationControl)
+                 {
+                     int arraySize = context.Definitions.ThreadsPerInputPrimitive;
++                    perVertexOutputArrayType = context.TypeArray(perVertexOutputStructType, context.Constant(context.TypeU32(), arraySize));
++                }
++                else if (context.Definitions.Stage == ShaderStage.Mesh)
++                {
++                    int arraySize = context.Definitions.MaxOutputVertices;
+                     perVertexOutputArrayType = context.TypeArray(perVertexOutputStructType, context.Constant(context.TypeU32(), arraySize));
+                 }
+                 else
+@@ -630,7 +681,12 @@
+                 };
+             }
+ 
+-            SpvInstruction spvType = context.GetType(varType, IoMap.GetSpirvBuiltInArrayLength(ioVariable));
++            // A mesh stage's user outputs are per-vertex arrays sized by the mesh's maximum vertex count.
++            int arrayLength = context.Definitions.Stage == ShaderStage.Mesh && isOutput && ioVariable == IoVariable.UserDefined
++                ? context.Definitions.MaxOutputVertices
++                : IoMap.GetSpirvBuiltInArrayLength(ioVariable);
++
++            SpvInstruction spvType = context.GetType(varType, arrayLength);
+             bool builtInPassthrough = false;
+ 
+             if (!isPerPatch && IoMap.IsPerVertex(ioVariable, context.Definitions.Stage, isOutput))
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/EnumConversion.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/EnumConversion.cs
+@@ -15,6 +15,8 @@
+                 ShaderStage.TessellationEvaluation => ExecutionModel.TessellationEvaluation,
+                 ShaderStage.Geometry => ExecutionModel.Geometry,
+                 ShaderStage.Fragment => ExecutionModel.Fragment,
++                ShaderStage.Task => ExecutionModel.TaskEXT,
++                ShaderStage.Mesh => ExecutionModel.MeshEXT,
+                 _ => throw new ArgumentException($"Invalid shader stage \"{stage}\"."),
+             };
+         }
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -144,6 +144,11 @@
+             Add(Instruction.VoteAll,                  GenerateVoteAll);
+             Add(Instruction.VoteAllEqual,             GenerateVoteAllEqual);
+             Add(Instruction.VoteAny,                  GenerateVoteAny);
++            Add(Instruction.MeshSetOutputs,          GenerateMeshSetOutputs);
++            Add(Instruction.MeshSetPrimitive,        GenerateMeshSetPrimitive);
++            Add(Instruction.MeshLoadPayload,         GenerateMeshLoadPayload);
++            Add(Instruction.MeshStorePayload,        GenerateMeshStorePayload);
++            Add(Instruction.EmitMeshTasks,           GenerateEmitMeshTasks);
+ #pragma warning restore IDE0055
+         }
+ 
+@@ -1802,7 +1807,10 @@
+                         : context.Properties.StorageBuffers[bindingIndex.Value];
+                     StructureField field = buffer.Type.Fields[fieldIndex.Value];
+ 
+-                    storageClass = StorageClass.Uniform;
++                    // SPV_EXT_mesh_shader modules are SPIR-V 1.4: storage buffers live in the StorageBuffer class.
++                    storageClass = storageKind == StorageKind.StorageBuffer && context.Definitions.Stage.IsMeshOrTask
++                        ? StorageClass.StorageBuffer
++                        : StorageClass.Uniform;
+                     varType = field.Type & AggregateType.ElementTypeMask;
+                     baseObj = storageKind == StorageKind.ConstantBuffer
+                         ? context.ConstantBuffers[bindingIndex.Value]
+@@ -1912,6 +1920,18 @@
+ 
+             bool isStoreOrAtomic = operation.Inst == Instruction.Store || operation.Inst.IsAtomic();
+             int inputsCount = (isStoreOrAtomic ? operation.SourcesCount - 1 : operation.SourcesCount) - srcIndex;
++
++            // A mesh stage's user output: [vertex, component] into the per-vertex array of this location.
++            if (context.Definitions.Stage == ShaderStage.Mesh &&
++                storageKind.IsOutput() &&
++                !storageKind.IsPerPatch() &&
++                ((AstOperand)operation.GetSource(0)).Value == (int)IoVariable.UserDefined)
++            {
++                SpvInstruction meshVertex = context.Get(AggregateType.S32, operation.GetSource(srcIndex++));
++                SpvInstruction meshComponent = context.Get(AggregateType.S32, operation.GetSource(srcIndex));
++
++                return context.AccessChain(context.TypePointer(storageClass, context.GetType(varType)), baseObj, meshVertex, meshComponent);
++            }
+ 
+             if (perVertexBuiltIn.HasValue)
+             {
+@@ -2282,5 +2302,76 @@
+                 context.GetU32(src3),
+                 context.GetU32(src4)));
+         }
++        // ---- task and mesh stages (SPV_EXT_mesh_shader)
++
++        private static OperationResult GenerateMeshSetOutputs(CodeGenContext context, AstOperation operation)
++        {
++            context.SetMeshOutputsEXT(
++                context.GetU32(operation.GetSource(0)),
++                context.GetU32(operation.GetSource(1)));
++
++            return OperationResult.Invalid;
++        }
++
++        private static OperationResult GenerateMeshSetPrimitive(CodeGenContext context, AstOperation operation)
++        {
++            if (context.PrimitiveTriangleIndices == null)
++            {
++                return OperationResult.Invalid;   // a mesh stage with no declared primitives
++            }
++
++            SpvInstruction index = context.GetS32(operation.GetSource(0));
++            SpvInstruction uvec3Type = context.TypeVector(context.TypeU32(), 3);
++            SpvInstruction value = context.CompositeConstruct(
++                uvec3Type,
++                context.GetU32(operation.GetSource(1)),
++                context.GetU32(operation.GetSource(2)),
++                context.GetU32(operation.GetSource(3)));
++            SpvInstruction pointerType = context.TypePointer(StorageClass.Output, uvec3Type);
++            SpvInstruction pointer = context.AccessChain(pointerType, context.PrimitiveTriangleIndices, index);
++
++            context.Store(pointer, value);
++
++            return OperationResult.Invalid;
++        }
++
++        private static SpvInstruction PayloadPointer(CodeGenContext context, IAstNode index)
++        {
++            SpvInstruction uintPointerType = context.TypePointer(StorageClass.TaskPayloadWorkgroupEXT, context.TypeU32());
++
++            return context.AccessChain(uintPointerType, context.TaskPayload, context.Constant(context.TypeS32(), 0),
++                                       context.GetS32(index));
++        }
++
++        private static OperationResult GenerateMeshLoadPayload(CodeGenContext context, AstOperation operation)
++        {
++            SpvInstruction value = context.Load(context.TypeU32(), PayloadPointer(context, operation.GetSource(0)));
++
++            return new OperationResult(AggregateType.U32, value);
++        }
++
++        private static OperationResult GenerateMeshStorePayload(CodeGenContext context, AstOperation operation)
++        {
++            context.Store(PayloadPointer(context, operation.GetSource(0)), context.GetU32(operation.GetSource(1)));
++
++            return OperationResult.Invalid;
++        }
++
++        private static OperationResult GenerateEmitMeshTasks(CodeGenContext context, AstOperation operation)
++        {
++            if (context.TaskPayload == null)
++            {
++                return OperationResult.Invalid;
++            }
++
++            context.EmitMeshTasksEXT(
++                context.GetU32(operation.GetSource(0)),
++                context.GetU32(operation.GetSource(1)),
++                context.GetU32(operation.GetSource(2)),
++                context.TaskPayload);
++
++            return OperationResult.Invalid;
++        }
++
+     }
+ }
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/IoMap.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/IoMap.cs
+@@ -100,7 +100,7 @@
+         {
+             if (storageKind == StorageKind.Output)
+             {
+-                return stage == ShaderStage.TessellationControl;
++                return stage is ShaderStage.TessellationControl or ShaderStage.Mesh;
+             }
+             else
+             {
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SpirvGenerator.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SpirvGenerator.cs
+@@ -99,6 +99,12 @@
+                 context.AddCapability(Capability.DrawParameters);
+             }
+ 
++            if (parameters.Definitions.Stage.IsMeshOrTask)
++            {
++                context.AddExtension("SPV_EXT_mesh_shader");
++                context.AddCapability(Capability.MeshShadingEXT);
++            }
++
+             if (context.Definitions.Stage != ShaderStage.Fragment &&
+                 context.Definitions.Stage != ShaderStage.Geometry &&
+                 context.Definitions.Stage != ShaderStage.Compute &&
+@@ -181,7 +187,8 @@
+ 
+             // Functions must always end with a return.
+             if (function.MainBlock.Last is not AstOperation operation ||
+-                (operation.Inst != Instruction.Return && operation.Inst != Instruction.Discard))
++                (operation.Inst != Instruction.Return && operation.Inst != Instruction.Discard &&
++                 operation.Inst != Instruction.EmitMeshTasks))
+             {
+                 context.Return();
+             }
+@@ -300,6 +307,23 @@
+                         localSizeY,
+                         localSizeZ);
+                 }
++                else if (context.Definitions.Stage.IsMeshOrTask)
++                {
++                    SpvLiteralInteger localSizeX = (SpvLiteralInteger)context.Definitions.ComputeLocalSizeX;
++                    SpvLiteralInteger localSizeY = (SpvLiteralInteger)context.Definitions.ComputeLocalSizeY;
++                    SpvLiteralInteger localSizeZ = (SpvLiteralInteger)context.Definitions.ComputeLocalSizeZ;
++
++                    context.AddExecutionMode(spvFunc, ExecutionMode.LocalSize, localSizeX, localSizeY, localSizeZ);
++
++                    if (context.Definitions.Stage == ShaderStage.Mesh)
++                    {
++                        context.AddExecutionMode(spvFunc, ExecutionMode.OutputVertices,
++                                                 (SpvLiteralInteger)context.Definitions.MaxOutputVertices);
++                        context.AddExecutionMode(spvFunc, ExecutionMode.OutputPrimitivesEXT,
++                                                 (SpvLiteralInteger)context.Definitions.MaxMeshOutputPrimitives);
++                        context.AddExecutionMode(spvFunc, ExecutionMode.OutputTrianglesEXT);
++                    }
++                }
+ 
+                 if (context.Definitions.TransformFeedbackEnabled && context.Definitions.LastInVertexPipeline)
+                 {
+--- a/src/Ryujinx.Graphics.Shader/Decoders/InstDecoders.cs
++++ b/src/Ryujinx.Graphics.Shader/Decoders/InstDecoders.cs
+@@ -3295,6 +3295,21 @@
+         public bool P => (_opcode & 0x80000000) != 0;
+     }
+ 
++    // The SM86 lowering's ISBERD/ISBEWR pseudo instruction (runtime/sm86_lower.h SM86_ISBE_OP): Rd or the data
++    // register at 0-7, the address register at 8-15, the byte offset at 20-43, the space at 44-47, write at 48.
++    readonly struct InstIsbe
++    {
++        private readonly ulong _opcode;
++        public InstIsbe(ulong opcode) => _opcode = opcode;
++        public int Dest => (int)(_opcode & 0xFF);
++        public int SrcA => (int)((_opcode >> 8) & 0xFF);
++        public int Offset => (int)((_opcode >> 20) & 0xFFFFFF);
++        public int Space => (int)((_opcode >> 44) & 0xF);
++        public bool Write => (_opcode & (1UL << 48)) != 0;
++        public int Pred => (int)((_opcode >> 16) & 0x7);
++        public bool PredInv => (_opcode & 0x80000) != 0;
++    }
++
+     readonly struct InstIscaddR
+     {
+         private readonly ulong _opcode;
+--- a/src/Ryujinx.Graphics.Shader/Decoders/InstName.cs
++++ b/src/Ryujinx.Graphics.Shader/Decoders/InstName.cs
+@@ -75,6 +75,8 @@
+         Imul32i,
+         Ipa,
+         Isberd,
++        Isbe,
++        MeshEpilogue,
+         Iscadd,
+         Iscadd32i,
+         Iset,
+--- a/src/Ryujinx.Graphics.Shader/Decoders/InstTable.cs
++++ b/src/Ryujinx.Graphics.Shader/Decoders/InstTable.cs
+@@ -34,6 +34,10 @@
+ #pragma warning disable IDE0055 // Disable formatting
+             Add("1110111110100xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", InstName.Al2p,        InstEmit.Al2p,        InstProps.Rd  | InstProps.Ra);
+             Add("1110111111011xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", InstName.Ald,         InstEmit.Ald,         InstProps.Rd  | InstProps.Ra);
++            // The SM86 lowering's mesh/task pseudo instructions (runtime/sm86_lower.h): the top byte 0x6c is an
++            // ISBERD/ISBEWR on the emulated stage buffer, 0x6d the epilogue every EXIT of the program branches to.
++            Add("01101100000000xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", InstName.Isbe,         InstEmit.Isbe,         InstProps.Rd  | InstProps.Ra);
++            Add("01101101000000xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", InstName.MeshEpilogue, InstEmit.MeshEpilogue, InstProps.None);
+             Add("1110111111110xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", InstName.Ast,         InstEmit.Ast,         InstProps.Ra  | InstProps.Rb2 | InstProps.Rc);
+             Add("11101101xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", InstName.Atom,        InstEmit.Atom,        InstProps.Rd  | InstProps.Ra  | InstProps.Rb);
+             Add("111011101111xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", InstName.AtomCas,     InstEmit.AtomCas,     InstProps.Rd  | InstProps.Ra  | InstProps.Rb);
+--- a/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
++++ b/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
+@@ -63,6 +63,55 @@
+         int CreateExtraSet()
+         {
+             return -1;
++        }
++
++        /// <summary>
++        /// Queries whether the program is a task or mesh shader (SPV_EXT_mesh_shader), decoded like a compute program.
++        /// </summary>
++        bool QueryIsMeshTaskStage()
++        {
++            return false;
++        }
++
++        /// <summary>
++        /// For a task or mesh program: the stage is Mesh (true) or Task (false).
++        /// </summary>
++        bool QueryIsMeshStage()
++        {
++            return true;
++        }
++
++        /// <summary>
++        /// A mesh program's maximum number of output vertices (control section +0x60, low 16 bits).
++        /// </summary>
++        int QueryMeshMaxVertices()
++        {
++            return 0;
++        }
++
++        /// <summary>
++        /// A mesh program's maximum number of output primitives (control section +0x60, high 16 bits).
++        /// </summary>
++        int QueryMeshMaxPrimitives()
++        {
++            return 0;
++        }
++
++        /// <summary>
++        /// The task payload in bytes (control section +0x58, top byte x 1024); 0 without a task stage.
++        /// </summary>
++        int QueryMeshPayloadSize()
++        {
++            return 0;
++        }
++
++        /// <summary>
++        /// A mesh program's VTG output map: the 16 bytes at the code header's +0x34 (system values A and B, then one
++        /// nibble per generic vector, low nibble first).
++        /// </summary>
++        ReadOnlySpan<byte> QueryMeshOutputMap()
++        {
++            return ReadOnlySpan<byte>.Empty;
+         }
+ 
+         /// <summary>
+--- /dev/null
++++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMesh.cs
+@@ -0,0 +1,296 @@
++using Ryujinx.Graphics.Shader.Decoders;
++using Ryujinx.Graphics.Shader.IntermediateRepresentation;
++using Ryujinx.Graphics.Shader.Translation;
++using static Ryujinx.Graphics.Shader.Instructions.InstEmitHelper;
++using static Ryujinx.Graphics.Shader.IntermediateRepresentation.OperandHelper;
++
++namespace Ryujinx.Graphics.Shader.Instructions
++{
++    // Task and mesh stages (SPV_EXT_mesh_shader). The SM86 lowering keeps ISBERD/ISBEWR as one pseudo instruction
++    // (runtime/sm86_lower.h SM86_ISBE_OP) and every EXIT branches to SM86_MESH_EPILOGUE, expanded here.
++    //
++    // The stage buffer is one shared array per program (ResourceManager.SetMeshStageBuffer). Its layout, from the
++    // game's code (docs/mesh.md):
++    //   TASK  0 is the workgroup index (the hardware preloads it), 4 the mesh workgroup count, the payload from 0x10;
++    //   ATTR  at MeshStageAttrBase: one 0x80-byte line per output component, vertex v's line k at
++    //         (v >> 5) * lines * 0x80 + k * 0x80 + (v & 31) * 4;
++    //   MAP   at MeshStageMapBase: the primitive count as a byte at +3, triangle p's three U8 indices from 4 + 3p.
++    // A task program's payload goes to its own shared array (MeshTaskPayloadMemoryId) and is copied into the SPIR-V
++    // payload variable in the epilogue; a mesh program of a task pipeline reads that variable (there is no shared
++    // memory between the two stages of a pipeline).
++    static partial class InstEmit
++    {
++        // ISBERD (write false) or ISBEWR (write true) on the stage buffer. The address register already holds the
++        // vertex group's and vertex's byte offset, so the byte address is the space's base + register + offset.
++        public static void Isbe(EmitterContext context)
++        {
++            InstIsbe op = context.GetOp<InstIsbe>();
++            TranslatorContext translator = context.TranslatorContext;
++            ShaderDefinitions definitions = translator.Definitions;
++            int stageId = context.ResourceManager.MeshStageBufferId;
++
++            if (stageId < 0 || definitions.Stage is not (ShaderStage.Task or ShaderStage.Mesh))
++            {
++                translator.GpuAccessor.Log("ISBE outside a task or mesh program.");
++                return;
++            }
++
++            Operand address = context.IAdd(GetSrcReg(context, op.SrcA), Const(op.Offset));
++
++            if (op.Space == 0x7)
++            {
++                EmitTaskSpace(context, definitions, stageId, op, address);
++                return;
++            }
++
++            int baseAddress = op.Space switch
++            {
++                0xf => definitions.MeshStageAttrBase,
++                0x1 or 0x0 => definitions.MeshStageMapBase,
++                _ => -1,
++            };
++
++            if (baseAddress < 0)
++            {
++                translator.GpuAccessor.Log($"ISBE space {op.Space} is not used by task or mesh programs.");
++                return;
++            }
++
++            address = baseAddress == 0 ? address : context.IAdd(address, Const(baseAddress));
++
++            if (!op.Write)
++            {
++                // ISBERD reads a 32-bit word (the address is word-aligned in every capture).
++                Operand word = context.ShiftRightU32(address, Const(2));
++                context.Copy(GetDest(op.Dest), context.Load(StorageKind.SharedMemory, stageId, word));
++            }
++            else if (op.Space is 0x0 or 0x1)
++            {
++                // MAP.U8: one triangle index. MAP.32 at +3: the primitive count, whose low byte is the only one that
++                // can be non-zero (at most 96 primitives) and the only one the epilogue reads. Both are byte stores
++                // into the word array, a read-modify-write of the containing word.
++                StoreByte(context, stageId, address, GetSrcReg(context, op.Dest));
++            }
++            else
++            {
++                // ATTR: one 32-bit vertex output component (the address is 4-byte aligned).
++                Operand word = context.ShiftRightU32(address, Const(2));
++                context.Store(StorageKind.SharedMemory, stageId, word, GetSrcReg(context, op.Dest));
++            }
++        }
++
++        private static void EmitTaskSpace(
++            EmitterContext context,
++            ShaderDefinitions definitions,
++            int stageId,
++            InstIsbe op,
++            Operand address)
++        {
++            if (!op.Write)
++            {
++                if (definitions.MeshPayloadSize > 0 && definitions.Stage == ShaderStage.Mesh)
++                {
++                    // A mesh program of a task pipeline reads the payload the task wrote, and 0 is its workgroup
++                    // index (the hardware's own value, not part of the payload).
++                    if (op.Offset < 0x10)
++                    {
++                        context.Copy(GetDest(op.Dest), op.Offset == 0 && op.SrcA == RegisterConsts.RegisterZeroIndex
++                            ? context.Load(StorageKind.Input, IoVariable.CtaId, null, Const(0))
++                            : Const(0));
++                    }
++                    else
++                    {
++                        context.Copy(GetDest(op.Dest), context.MeshLoadPayload(Const((op.Offset - 0x10) >> 2)));
++                    }
++                    return;
++                }
++
++                // Without a payload variable the task space is the first words of the stage buffer (0: workgroup
++                // index, 4: count), filled by EmitStart and by Isbe's own writes.
++                Operand word = context.ShiftRightU32(address, Const(2));
++                context.Copy(GetDest(op.Dest), context.Load(StorageKind.SharedMemory, stageId, word));
++                return;
++            }
++
++            int payloadId = context.ResourceManager.MeshTaskPayloadMemoryId;
++
++            if (op.Offset >= 0x10 && definitions.MeshPayloadSize > 0 && payloadId >= 0)
++            {
++                context.Store(StorageKind.SharedMemory, payloadId, Const((op.Offset - 0x10) >> 2),
++                              GetSrcReg(context, op.Dest));
++            }
++            else if (op.Offset == 4)
++            {
++                // The mesh workgroup count: one lane writes it, every lane reads it in the epilogue.
++                context.Store(StorageKind.SharedMemory, stageId, Const(1), GetSrcReg(context, op.Dest));
++            }
++            else
++            {
++                Operand word = context.ShiftRightU32(address, Const(2));
++                context.Store(StorageKind.SharedMemory, stageId, word, GetSrcReg(context, op.Dest));
++            }
++        }
++
++        private static void StoreByte(EmitterContext context, int stageId, Operand address, Operand value)
++        {
++            Operand word = context.ShiftRightU32(address, Const(2));
++            Operand shift = context.ShiftLeft(context.BitwiseAnd(address, Const(3)), Const(3));
++            Operand old = context.Load(StorageKind.SharedMemory, stageId, word);
++            Operand keep = context.BitwiseAnd(old, context.BitwiseNot(context.ShiftLeft(Const(0xff), shift)));
++            Operand insert = context.ShiftLeft(context.BitwiseAnd(value, Const(0xff)), shift);
++            context.Store(StorageKind.SharedMemory, stageId, word, context.BitwiseOr(keep, insert));
++        }
++
++        // SM86_MESH_EPILOGUE: every EXIT of a task or mesh program branches here. One barrier makes the stage buffer
++        // complete (the primitive count is written by one lane), then it becomes the stage's outputs.
++        public static void MeshEpilogue(EmitterContext context)
++        {
++            TranslatorContext translator = context.TranslatorContext;
++            ShaderDefinitions definitions = translator.Definitions;
++            int stageId = context.ResourceManager.MeshStageBufferId;
++
++            if (stageId < 0)
++            {
++                translator.GpuAccessor.Log("mesh epilogue without a stage buffer.");
++                return;
++            }
++
++            context.Barrier();
++
++            if (definitions.Stage == ShaderStage.Mesh)
++            {
++                EmitMeshOutputs(context, definitions, stageId);
++            }
++            else
++            {
++                EmitTaskOutputs(context, definitions, context.ResourceManager.MeshTaskPayloadMemoryId);
++            }
++        }
++
++        private static void EmitMeshOutputs(EmitterContext context, ShaderDefinitions definitions, int stageId)
++        {
++            Operand threadId = context.Load(StorageKind.Input, IoVariable.ThreadId, null, Const(0));
++
++            // The primitive count as a byte at MAP + 3 (see Isbe: MAP.32 only has a meaningful low byte).
++            int countByte = definitions.MeshStageMapBase + 3;
++            Operand countWord = context.Load(StorageKind.SharedMemory, stageId, Const(countByte >> 2));
++            Operand primitives = context.BitwiseAnd(
++                context.ShiftRightU32(countWord, Const((countByte & 3) * 8)), Const(0xff));
++
++            // A count above the mesh's declared maximum is undefined in Vulkan (and takes the device down): clamp it.
++            primitives = context.IMinimumU32(primitives, Const(definitions.MaxMeshOutputPrimitives));
++
++            context.MeshSetOutputs(Const(definitions.MaxOutputVertices), primitives);
++
++            int lines = definitions.MeshOutputLines.Length;
++            int groups = (definitions.MaxOutputVertices + 31) / 32;
++
++            for (int group = 0; group < groups; group++)
++            {
++                Operand vertex = group == 0 ? threadId : context.IAdd(threadId, Const(group * 32));
++
++                for (int line = 0; line < lines; line++)
++                {
++                    Operand word = context.Load(
++                        StorageKind.SharedMemory,
++                        stageId,
++                        context.IAdd(Const((group * lines + line) * 32), threadId));
++
++                    MeshOutputLine output = definitions.MeshOutputLines[line];
++
++                    if (output.Position)
++                    {
++                        context.Add(
++                            Instruction.Store,
++                            StorageKind.Output,
++                            null,
++                            Const((int)IoVariable.Position),
++                            vertex,
++                            Const(output.Component),
++                            word);
++                    }
++                    else
++                    {
++                        context.Add(
++                            Instruction.Store,
++                            StorageKind.Output,
++                            null,
++                            Const((int)IoVariable.UserDefined),
++                            Const(output.Location),
++                            vertex,
++                            Const(output.Component),
++                            word);
++                    }
++                }
++            }
++
++            // Every lane takes the primitives it wrote: p = lane, lane + 32, ...
++            Operand primitive = Local();
++            Operand lblHead = Label();
++            Operand lblDone = Label();
++
++            context.Copy(primitive, threadId);
++            context.MarkLabel(lblHead);
++            context.BranchIfTrue(lblDone, context.ICompareGreaterOrEqualUnsigned(primitive, primitives));
++
++            Operand indices = context.IMultiply(primitive, Const(3));
++            indices = context.IAdd(indices, Const(definitions.MeshStageMapBase + 4));
++
++            Operand i0 = LoadMapByte(context, stageId, indices, 0);
++            Operand i1 = LoadMapByte(context, stageId, indices, 1);
++            Operand i2 = LoadMapByte(context, stageId, indices, 2);
++
++            // A vertex index at or above the declared vertex count is undefined in Vulkan and can take the device
++            // down; the game's own indices are below maxV, so this only guards a bad stage buffer.
++            Operand lastVertex = Const(definitions.MaxOutputVertices - 1);
++            i0 = context.IMinimumU32(i0, lastVertex);
++            i1 = context.IMinimumU32(i1, lastVertex);
++            i2 = context.IMinimumU32(i2, lastVertex);
++
++            context.MeshSetPrimitive(primitive, i0, i1, i2);
++
++            context.Copy(primitive, context.IAdd(primitive, Const(32)));
++            context.Branch(lblHead);
++            context.MarkLabel(lblDone);
++        }
++
++        private static Operand LoadMapByte(EmitterContext context, int stageId, Operand baseAddress, int add)
++        {
++            Operand address = context.IAdd(baseAddress, Const(add));
++            Operand word = context.Load(StorageKind.SharedMemory, stageId, context.ShiftRightU32(address, Const(2)));
++            Operand shift = context.ShiftLeft(context.BitwiseAnd(address, Const(3)), Const(3));
++
++            return context.BitwiseAnd(context.ShiftRightU32(word, shift), Const(0xff));
++        }
++
++        private static void EmitTaskOutputs(EmitterContext context, ShaderDefinitions definitions, int payloadId)
++        {
++            int words = definitions.MeshPayloadSize >> 2;
++
++            // Every lane moves the payload words it wrote into the payload variable the mesh stage reads.
++            if (words > 0 && payloadId >= 0)
++            {
++                Operand threadId = context.Load(StorageKind.Input, IoVariable.ThreadId, null, Const(0));
++                Operand index = Local();
++                Operand lblHead = Label();
++                Operand lblDone = Label();
++
++                context.Copy(index, threadId);
++                context.MarkLabel(lblHead);
++                context.BranchIfTrue(lblDone, context.ICompareGreaterOrEqualUnsigned(index, Const(words)));
++
++                context.MeshStorePayload(index, context.Load(StorageKind.SharedMemory, payloadId, index));
++
++                context.Copy(index, context.IAdd(index, Const(32)));
++                context.Branch(lblHead);
++                context.MarkLabel(lblDone);
++            }
++
++            // The mesh workgroup count, written at TASK + 4 by one lane (Isbe stores it at the stage buffer's word 1).
++            // Clamped to the API's workgroup limit: a bad value would otherwise run for ever and lose the device.
++            Operand count = context.Load(StorageKind.SharedMemory, context.ResourceManager.MeshStageBufferId, Const(1));
++            count = context.IMinimumU32(count, Const(0xffff));
++            context.EmitMeshTasks(count, Const(1), Const(1));
++        }
++    }
++}
+--- a/src/Ryujinx.Graphics.Shader/IntermediateRepresentation/Instruction.cs
++++ b/src/Ryujinx.Graphics.Shader/IntermediateRepresentation/Instruction.cs
+@@ -127,6 +127,13 @@
+         VoteAny,
+         MatrixMultiplyAdd,
+ 
++        // SPV_EXT_mesh_shader (task and mesh stages)
++        MeshSetOutputs,      // OpSetMeshOutputsEXT: vertex count, primitive count
++        MeshSetPrimitive,    // one primitive's three vertex indices (gl_PrimitiveTriangleIndicesEXT)
++        MeshLoadPayload,     // a payload word of the current workgroup (a mesh stage of a task pipeline)
++        MeshStorePayload,    // a payload word (a task stage)
++        EmitMeshTasks,       // OpEmitMeshTasksEXT: workgroup counts
++
+         Count,
+ 
+         FP32 = 1 << 16,
+--- a/src/Ryujinx.Graphics.Shader/ShaderStage.cs
++++ b/src/Ryujinx.Graphics.Shader/ShaderStage.cs
+@@ -8,6 +8,8 @@
+         TessellationEvaluation,
+         Geometry,
+         Fragment,
++        Task,
++        Mesh,
+ 
+         Count,
+     }
+@@ -30,6 +32,12 @@
+                     ShaderStage.TessellationControl or
+                     ShaderStage.TessellationEvaluation or
+                     ShaderStage.Geometry;
++
++            /// <summary>
++            /// Checks if the shader stage is a mesh or task stage (SPV_EXT_mesh_shader).
++            /// </summary>
++            public bool IsMeshOrTask =>
++                shaderStage is ShaderStage.Task or ShaderStage.Mesh;
+         }
+         
+     }
+--- a/src/Ryujinx.Graphics.Shader/StructuredIr/AstOptimizer.cs
++++ b/src/Ryujinx.Graphics.Shader/StructuredIr/AstOptimizer.cs
+@@ -74,6 +74,10 @@
+                     case Instruction.AtomicXor:
+                     case Instruction.Call:
+                     case Instruction.ImageAtomic:
++                    case Instruction.MeshSetOutputs:
++                    case Instruction.MeshSetPrimitive:
++                    case Instruction.MeshStorePayload:
++                    case Instruction.EmitMeshTasks:
+                         return true;
+                 }
+             }
+@@ -91,6 +95,7 @@
+             Instruction inst = op.Inst & Instruction.Mask;
+ 
+             if (inst == Instruction.ImageLoad ||
++                inst == Instruction.MeshLoadPayload ||
+                 (inst == Instruction.Load && op.StorageKind is not (StorageKind.None or StorageKind.ConstantBuffer) &&
+                  !op.StorageKind.IsInputOrOutput()))
+             {
+--- a/src/Ryujinx.Graphics.Shader/StructuredIr/InstructionInfo.cs
++++ b/src/Ryujinx.Graphics.Shader/StructuredIr/InstructionInfo.cs
+@@ -134,6 +134,13 @@
+             Add(Instruction.VoteAll,                  AggregateType.Bool,   AggregateType.Bool);
+             Add(Instruction.VoteAllEqual,             AggregateType.Bool,   AggregateType.Bool);
+             Add(Instruction.VoteAny,                  AggregateType.Bool,   AggregateType.Bool);
++
++            // Task and mesh stages (SPV_EXT_mesh_shader)
++            Add(Instruction.MeshSetOutputs,    AggregateType.Void, AggregateType.U32, AggregateType.U32);
++            Add(Instruction.MeshSetPrimitive,  AggregateType.Void, AggregateType.S32, AggregateType.U32, AggregateType.U32, AggregateType.U32);
++            Add(Instruction.MeshLoadPayload,   AggregateType.U32,  AggregateType.S32);
++            Add(Instruction.MeshStorePayload,  AggregateType.Void, AggregateType.S32, AggregateType.U32);
++            Add(Instruction.EmitMeshTasks,     AggregateType.Void, AggregateType.U32, AggregateType.U32, AggregateType.U32);
+ #pragma warning restore IDE0055
+         }
+ 
+--- a/src/Ryujinx.Graphics.Shader/Translation/EmitterContext.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/EmitterContext.cs
+@@ -81,6 +81,27 @@
+                 return;
+             }
+ 
++            // A task or mesh program's stage buffer starts with the workgroup index the hardware preloads (a task or
++            // stand-alone mesh program reads it with ISBERD.ATTR/ISBE.TASK at 0).
++            if (!IsNonMain && TranslatorContext.Definitions.Stage is ShaderStage.Task or ShaderStage.Mesh)
++            {
++                int stageBufferId = ResourceManager.MeshStageBufferId;
++
++                if (stageBufferId >= 0)
++                {
++                    Operand ctaId = this.Load(StorageKind.Input, IoVariable.CtaId, null, Const(0));
++
++                    this.Store(StorageKind.SharedMemory, stageBufferId, Const(0), ctaId);
++
++                    int attrBase = TranslatorContext.Definitions.MeshStageAttrBase;
++
++                    if (attrBase != 0)
++                    {
++                        this.Store(StorageKind.SharedMemory, stageBufferId, Const(attrBase >> 2), ctaId);
++                    }
++                }
++            }
++
+             // Vulkan requires the point size to be always written on the shader if the primitive topology is points.
+             // OpenGL requires the point size to be always written on the shader if PROGRAM_POINT_SIZE is set.
+             if (TranslatorContext.Definitions.Stage == ShaderStage.Vertex)
+@@ -349,6 +370,12 @@
+             if (IsNonMain)
+             {
+                 return true;
++            }
++
++            // A task shader ends in OpEmitMeshTasksEXT, which terminates its block: no Return follows it.
++            if (TranslatorContext.Definitions.Stage == ShaderStage.Task)
++            {
++                return false;
+             }
+ 
+             if (TranslatorContext.Definitions.LastInVertexPipeline &&
+--- a/src/Ryujinx.Graphics.Shader/Translation/EmitterContextInsts.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/EmitterContextInsts.cs
+@@ -119,6 +119,32 @@
+             context.Add(new Operation(Instruction.Ballot, index, dest, a));
+ 
+             return dest;
++        }
++
++        // ---- task and mesh stages (InstEmitMesh.cs)
++        public static void MeshSetOutputs(this EmitterContext context, Operand vertexCount, Operand primitiveCount)
++        {
++            context.Add(Instruction.MeshSetOutputs, null, vertexCount, primitiveCount);
++        }
++
++        public static void MeshSetPrimitive(this EmitterContext context, Operand index, Operand v0, Operand v1, Operand v2)
++        {
++            context.Add(Instruction.MeshSetPrimitive, null, index, v0, v1, v2);
++        }
++
++        public static Operand MeshLoadPayload(this EmitterContext context, Operand index)
++        {
++            return context.Add(Instruction.MeshLoadPayload, Local(), index);
++        }
++
++        public static void MeshStorePayload(this EmitterContext context, Operand index, Operand value)
++        {
++            context.Add(Instruction.MeshStorePayload, null, index, value);
++        }
++
++        public static void EmitMeshTasks(this EmitterContext context, Operand countX, Operand countY, Operand countZ)
++        {
++            context.Add(Instruction.EmitMeshTasks, null, countX, countY, countZ);
+         }
+ 
+         public static Operand Barrier(this EmitterContext context)
+--- a/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
+@@ -14,7 +14,7 @@
+         private const int DefaultLocalMemorySize = 128;
+         private const int DefaultSharedMemorySize = 4096;
+ 
+-        private static readonly string[] _stagePrefixes = new string[] { "cp", "vp", "tcp", "tep", "gp", "fp" };
++        private static readonly string[] _stagePrefixes = new string[] { "cp", "vp", "tcp", "tep", "gp", "fp", "tp", "mp" };
+ 
+         private readonly IGpuAccessor _gpuAccessor;
+         private readonly ShaderStage _stage;
+@@ -127,6 +127,27 @@
+             {
+                 SharedMemoryId = -1;
+             }
++        }
++
++        // The emulated stage buffer of a task or mesh program, as shared memory (docs/mesh.md): the translator
++        // expands its ISBERD/ISBEWR pseudo instructions into loads and stores at these offsets.
++        public int MeshStageBufferId { get; private set; } = -1;
++
++        public void SetMeshStageBuffer(int size)
++        {
++            MemoryDefinition stage = new MemoryDefinition("mesh_stage", AggregateType.Array | AggregateType.U32,
++                                                          (size + 3) / 4);
++            MeshStageBufferId = Properties.AddSharedMemory(stage);
++        }
++
++        // A task program's payload, copied into the SPIR-V payload variable in the epilogue.
++        public int MeshTaskPayloadMemoryId { get; private set; } = -1;
++
++        public void SetMeshTaskPayload(int size)
++        {
++            MemoryDefinition payload = new MemoryDefinition("mesh_payload", AggregateType.Array | AggregateType.U32,
++                                                             (size + 3) / 4);
++            MeshTaskPayloadMemoryId = Properties.AddSharedMemory(payload);
+         }
+ 
+         public void SetVertexAsComputeLocalMemories(ShaderStage stage, InputTopology inputTopology)
+--- a/src/Ryujinx.Graphics.Shader/Translation/ShaderDefinitions.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/ShaderDefinitions.cs
+@@ -5,6 +5,15 @@
+ 
+ namespace Ryujinx.Graphics.Shader.Translation
+ {
++    // One component line of a mesh program's vertex outputs: a position component or a user attribute component,
++    // in the order the VTG output map lists them (docs/mesh.md).
++    struct MeshOutputLine
++    {
++        public int Location;
++        public int Component;
++        public bool Position;
++    }
++
+     class ShaderDefinitions
+     {
+         private readonly GpuGraphicsState _graphicsState;
+@@ -38,6 +47,18 @@
+         public OutputTopology OutputTopology { get; }
+ 
+         public int MaxOutputVertices { get; }
++
++        // Task and mesh stages (SPV_EXT_mesh_shader). The emulated stage buffer is one shared array per program:
++        // the task space at 0 (workgroup index, mesh count at +4, payload from +0x10), then the vertex output
++        // lines, then the primitive map (count at +3, U8 vertex indices from +4).
++        public int MaxMeshOutputPrimitives { get; }
++        public int MeshPayloadSize { get; }
++        public MeshOutputLine[] MeshOutputLines { get; }
++        public int MeshStageAttrBase { get; }
++        public int MeshStageMapBase { get; }
++        public int MeshStageBufferSize { get; }
++
++        public bool IsMeshOrTask => Stage is ShaderStage.Task or ShaderStage.Mesh;
+ 
+         public bool DualSourceBlend => _graphicsState.DualSourceBlendEnable;
+         public bool EarlyZForce => _graphicsState.EarlyZForce;
+@@ -119,6 +140,68 @@
+             ComputeLocalSizeX = computeLocalSizeX;
+             ComputeLocalSizeY = computeLocalSizeY;
+             ComputeLocalSizeZ = computeLocalSizeZ;
++        }
++
++        // A task or mesh program: decoded as a compute program (workgroup, thread id, local memory, barriers), with
++        // the mesh output map and limits the host read from the control section and the code header.
++        public ShaderDefinitions(
++            ShaderStage stage,
++            int localSizeX,
++            int localSizeY,
++            int localSizeZ,
++            int maxVertices,
++            int maxPrimitives,
++            int payloadSize,
++            ReadOnlySpan<byte> outputMap)
++        {
++            Stage = stage;
++            ComputeLocalSizeX = localSizeX;
++            ComputeLocalSizeY = localSizeY;
++            ComputeLocalSizeZ = localSizeZ;
++            // Executions modes need a non-zero count: a mesh stage that declares none still gets a valid module.
++            MaxOutputVertices = Math.Max(1, maxVertices);
++            MaxMeshOutputPrimitives = Math.Max(1, maxPrimitives);
++            MeshPayloadSize = payloadSize;
++            maxVertices = MaxOutputVertices;
++            maxPrimitives = MaxMeshOutputPrimitives;
++
++            List<MeshOutputLine> lines = new();
++            if (stage == ShaderStage.Mesh)
++            {
++                // System values B at +0x35: bits 4..7 are position x, y, z, w.
++                for (int c = 0; c < 4; c++)
++                {
++                    if ((outputMap[1] & (1 << (c + 4))) != 0)
++                    {
++                        lines.Add(new MeshOutputLine { Position = true, Component = c });
++                    }
++                }
++
++                // One nibble per generic vector from +0x36, low nibble first; bit c is component c.
++                for (int v = 0; v < 28; v++)
++                {
++                    int index = 2 + (v >> 1);
++                    if (index >= outputMap.Length) break;
++                    int nibble = (outputMap[index] >> ((v & 1) * 4)) & 0xf;
++                    for (int c = 0; c < 4; c++)
++                    {
++                        if ((nibble & (1 << c)) != 0)
++                        {
++                            lines.Add(new MeshOutputLine { Location = v, Component = c });
++                        }
++                    }
++                }
++            }
++            MeshOutputLines = lines.ToArray();
++
++            // Only a task stage keeps its payload in shared memory; a mesh stage reads the payload variable.
++            int attr = stage == ShaderStage.Task ? 0x10 + payloadSize : 0x10;
++            MeshStageAttrBase = (attr + 0xff) & ~0xff;
++            int groups = maxVertices > 0 ? (maxVertices + 31) / 32 : 0;
++            int attrSize = groups * MeshOutputLines.Length * 0x80;
++            MeshStageMapBase = MeshStageAttrBase + attrSize;
++            int mapSize = (4 + 3 * maxPrimitives + 0xff) & ~0xff;
++            MeshStageBufferSize = Math.Max(0x100, MeshStageMapBase + mapSize);
+         }
+ 
+         public ShaderDefinitions(
+@@ -298,6 +381,12 @@
+ 
+         public AggregateType GetUserDefinedType(int location, bool isOutput)
+         {
++            // A mesh stage writes each user output at a vertex index: an array of vec4 per location.
++            if (Stage == ShaderStage.Mesh && isOutput)
++            {
++                return AggregateType.Array | AggregateType.Vector4 | AggregateType.FP32;
++            }
++
+             if ((!isOutput && IaIndexing) || (isOutput && OaIndexing))
+             {
+                 return AggregateType.Array | AggregateType.Vector4 | AggregateType.FP32;
+--- a/src/Ryujinx.Graphics.Shader/Translation/TranslationFlags.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/TranslationFlags.cs
+@@ -10,5 +10,6 @@
+         VertexA = 1 << 0,
+         Compute = 1 << 1,
+         DebugMode = 1 << 2,
++        MeshShader = 1 << 3,   // task or mesh (SPV_EXT_mesh_shader); decoded as compute, emitted as a mesh stage
+     }
+ }
+--- a/src/Ryujinx.Graphics.Shader/Translation/Translator.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Translator.cs
+@@ -39,6 +39,15 @@
+ 
+                 program = Decoder.Decode(definitions, gpuAccessor, address);
+             }
++            else if (options.Flags.HasFlag(TranslationFlags.MeshShader))
++            {
++                // A task or mesh program keeps the graphics header the lowering copied, but decodes like compute
++                // (workgroup and thread ids, local memory, shared memory, barriers) from the instructions after it.
++                definitions = CreateMeshDefinitions(gpuAccessor);
++                localMemorySize = gpuAccessor.QueryComputeLocalMemorySize();
++
++                program = Decoder.Decode(definitions, gpuAccessor, address + HeaderSize);
++            }
+             else
+             {
+                 ShaderHeader header = new(gpuAccessor, address);
+@@ -62,7 +71,8 @@
+                 }
+             }
+ 
+-            int size = (int)maxEndAddress + (options.Flags.HasFlag(TranslationFlags.Compute) ? 0 : HeaderSize);
++            bool hasHeader = !options.Flags.HasFlag(TranslationFlags.Compute);
++            int size = (int)maxEndAddress + (hasHeader ? HeaderSize : 0);
+ 
+             return new TranslatorContext(address, size, localMemorySize, definitions, gpuAccessor, options, program);
+         }
+@@ -74,6 +84,19 @@
+                 gpuAccessor.QueryComputeLocalSizeX(),
+                 gpuAccessor.QueryComputeLocalSizeY(),
+                 gpuAccessor.QueryComputeLocalSizeZ());
++        }
++
++        private static ShaderDefinitions CreateMeshDefinitions(IGpuAccessor gpuAccessor)
++        {
++            return new ShaderDefinitions(
++                gpuAccessor.QueryIsMeshStage() ? ShaderStage.Mesh : ShaderStage.Task,
++                gpuAccessor.QueryComputeLocalSizeX(),
++                gpuAccessor.QueryComputeLocalSizeY(),
++                gpuAccessor.QueryComputeLocalSizeZ(),
++                gpuAccessor.QueryMeshMaxVertices(),
++                gpuAccessor.QueryMeshMaxPrimitives(),
++                gpuAccessor.QueryMeshPayloadSize(),
++                gpuAccessor.QueryMeshOutputMap());
+         }
+ 
+         private static ShaderDefinitions CreateGraphicsDefinitions(IGpuAccessor gpuAccessor, ShaderHeader header)
+@@ -182,8 +205,9 @@
+         private static void EmitOutputsInitialization(EmitterContext context, AttributeUsage attributeUsage, IGpuAccessor gpuAccessor, ShaderStage stage)
+         {
+             // Compute has no output attributes, so we
+-            // don't need to initialize outputs on that stage.
+-            if (stage == ShaderStage.Compute)
++            // don't need to initialize outputs on that stage. Mesh and task outputs come from the emulated stage
++            // buffer in the epilogue instead, and its stores are the only ones they accept.
++            if (stage == ShaderStage.Compute || stage.IsMeshOrTask)
+             {
+                 return;
+             }
+--- a/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs
+@@ -198,6 +198,16 @@
+             bool usesLocalMemory = _program.UsedFeatures.HasFlag(FeatureFlags.LocalMemory);
+ 
+             resourceManager.SetCurrentLocalMemory(_localMemorySize, usesLocalMemory);
++
++            if (Stage.IsMeshOrTask)
++            {
++                resourceManager.SetMeshStageBuffer(Definitions.MeshStageBufferSize);
++
++                if (Stage == ShaderStage.Task && Definitions.MeshPayloadSize > 0)
++                {
++                    resourceManager.SetMeshTaskPayload(Definitions.MeshPayloadSize);
++                }
++            }
+ 
+             if (Stage == ShaderStage.Compute)
+             {
+--- a/src/Spv.Generator/Autogenerated/CoreGrammar.cs
++++ b/src/Spv.Generator/Autogenerated/CoreGrammar.cs
+@@ -3218,6 +3218,31 @@
+             return result;
+         }
+ 
++        // SPV_EXT_mesh_shader (hand-written; the vendored grammar predates the extension).
++        public Instruction EmitMeshTasksEXT(Instruction groupCountX, Instruction groupCountY, Instruction groupCountZ, Instruction payload)
++        {
++            Instruction result = NewInstruction(Op.OpEmitMeshTasksEXT);
++
++            result.AddOperand(groupCountX);
++            result.AddOperand(groupCountY);
++            result.AddOperand(groupCountZ);
++            result.AddOperand(payload);
++            AddToFunctionDefinitions(result);
++
++            return result;
++        }
++
++        public Instruction SetMeshOutputsEXT(Instruction vertexCount, Instruction primitiveCount)
++        {
++            Instruction result = NewInstruction(Op.OpSetMeshOutputsEXT);
++
++            result.AddOperand(vertexCount);
++            result.AddOperand(primitiveCount);
++            AddToFunctionDefinitions(result);
++
++            return result;
++        }
++
+         public Instruction EmitStreamVertex(Instruction stream)
+         {
+             Instruction result = NewInstruction(Op.OpEmitStreamVertex);
+--- a/src/Spv.Generator/Module.cs
++++ b/src/Spv.Generator/Module.cs
+@@ -206,6 +206,11 @@
+             _globals.Add(variable);
+         }
+ 
++        /// <summary>
++        /// Every global variable added so far (SPIR-V 1.4 lists all of them in the entry point's interface).
++        /// </summary>
++        public IReadOnlyList<Instruction> GlobalVariables => _globals;
++
+         private void AddConstant(Instruction constant)
+         {
+             Debug.Assert(constant.Opcode is Op.OpConstant or
+--- a/src/Spv.Generator/spirv.cs
++++ b/src/Spv.Generator/spirv.cs
+@@ -74,6 +74,8 @@
+             Kernel = 6,
+             TaskNV = 5267,
+             MeshNV = 5268,
++            TaskEXT = 5364,
++            MeshEXT = 5365,
+             RayGenerationKHR = 5313,
+             RayGenerationNV = RayGenerationKHR,
+             IntersectionKHR = 5314,
+@@ -155,9 +157,11 @@
+             StencilRefReplacingEXT = 5027,
+             OutputLinesNV = 5269,
+             OutputPrimitivesNV = 5270,
++            OutputPrimitivesEXT = OutputPrimitivesNV,
+             DerivativeGroupQuadsNV = 5289,
+             DerivativeGroupLinearNV = 5290,
+             OutputTrianglesNV = 5298,
++            OutputTrianglesEXT = OutputTrianglesNV,
+             PixelInterlockOrderedEXT = 5366,
+             PixelInterlockUnorderedEXT = 5367,
+             SampleInterlockOrderedEXT = 5368,
+@@ -197,6 +201,7 @@
+             IncomingRayPayloadNV = IncomingRayPayloadKHR,
+             ShaderRecordBufferKHR = 5343,
+             ShaderRecordBufferNV = ShaderRecordBufferKHR,
++            TaskPayloadWorkgroupEXT = 5402,
+             PhysicalStorageBuffer = 5349,
+             PhysicalStorageBufferEXT = PhysicalStorageBuffer,
+             CodeSectionINTEL = 5605,
+@@ -474,6 +479,7 @@
+             ViewportRelativeNV = 5252,
+             SecondaryViewportRelativeNV = 5256,
+             PerPrimitiveNV = 5271,
++            PerPrimitiveEXT = PerPrimitiveNV,
+             PerViewNV = 5272,
+             PerTaskNV = 5273,
+             PerVertexNV = 5285,
+@@ -590,6 +596,8 @@
+             FragSizeEXT = 5292,
+             FragmentSizeNV = FragSizeEXT,
+             FragInvocationCountEXT = 5293,
++            PrimitiveTriangleIndicesEXT = 5296,
++            CullPrimitiveEXT = 5299,
+             InvocationsPerPixelNV = FragInvocationCountEXT,
+             LaunchIdKHR = 5319,
+             LaunchIdNV = LaunchIdKHR,
+@@ -922,6 +930,7 @@
+             PerViewAttributesNV = 5260,
+             FragmentFullyCoveredEXT = 5265,
+             MeshShadingNV = 5266,
++            MeshShadingEXT = 5283,
+             ImageFootprintNV = 5282,
+             FragmentBarycentricNV = 5284,
+             ComputeDerivativeGroupQuadsNV = 5288,
+@@ -1256,6 +1265,8 @@
+             OpDPdxCoarse = 213,
+             OpDPdyCoarse = 214,
+             OpFwidthCoarse = 215,
++            OpEmitMeshTasksEXT = 5294,
++            OpSetMeshOutputsEXT = 5295,
+             OpEmitVertex = 218,
+             OpEndPrimitive = 219,
+             OpEmitStreamVertex = 220,

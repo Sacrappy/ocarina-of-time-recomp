@@ -82,10 +82,10 @@ typedef struct VkExec {
     // ---- vk_exec_draw.c slots (draws, binds, dispatch): left empty by vk_exec.c
     const prog_t *prog;                  // OP_BIND_PROGRAM: the program serving every stage (vk_exec_draw.c bind_program)
     int32_t prog_stages;
-    const prog_t *stage_prog[6];         // the program bound for each NVN stage (separable binds)
+    const prog_t *stage_prog[8];         // the program bound for each NVN stage (separable binds)
     NVNbufferRange vbuf[16];             // OP_BIND_VBUF
-    p_bind_buf ubo[6][18], ssbo[6][16];  // OP_BIND_UBO / OP_BIND_SSBO per stage and index
-    uint64_t tex[6][128], samp[6][128], img[6][32];   // OP_BIND_TEX / OP_BIND_SAMP / OP_BIND_IMG handles per stage
+    p_bind_buf ubo[8][18], ssbo[8][16];  // OP_BIND_UBO / OP_BIND_SSBO per stage and index
+    uint64_t tex[8][128], samp[8][128], img[8][32];   // OP_BIND_TEX / OP_BIND_SAMP / OP_BIND_IMG handles per stage
     uint8_t push_cc[0x800];              // OP_PUSH_CC (VK_C0_BYTES, defined below): the compute kernels' pushed constants (NVN2), read as bank 0
     uint32_t push_cc_len;                // bytes pushed so far (0: none, c0 is the driver bank)
 

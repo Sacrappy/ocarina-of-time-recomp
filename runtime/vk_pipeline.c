@@ -1171,7 +1171,8 @@ static VkDescriptorType descriptor_type(int kind, const GfxShaderRes *r) {
 
 static VkShaderStageFlags stage_bit(int stage) {
     return stage == GFX_STAGE_VS ? VK_SHADER_STAGE_VERTEX_BIT : stage == GFX_STAGE_FS ? VK_SHADER_STAGE_FRAGMENT_BIT
-                                                                                      : VK_SHADER_STAGE_COMPUTE_BIT;
+    : stage == GFX_STAGE_TS ? VK_SHADER_STAGE_TASK_BIT_EXT : stage == GFX_STAGE_MS ? VK_SHADER_STAGE_MESH_BIT_EXT
+    : VK_SHADER_STAGE_COMPUTE_BIT;
 }
 
 // One past the highest binding a shader uses (1 with no resources: binding 0 is the support buffer).
@@ -1256,6 +1257,21 @@ static int module_binding_missing(const GfxShader *s, const VkDescriptorSetLayou
     if (missing < 0 && pool && !P.pool_layout) missing = 2000;
     free(ref), free(pool);
     return missing;
+}
+
+// Checks a task/mesh pipeline's stages against its layout.
+static int layout_covers_mesh(const VkPipeState *s, const Layout *l, uint32_t off_ms, uint32_t off_fs, char *why, size_t cap) {
+    int m = module_binding_missing(s->mesh, l->b, l->n, off_ms);
+    const GfxShader *sh = s->mesh;
+    const char *stage = "mesh";
+    if (m < 0 && s->ts) { m = module_binding_missing(s->ts, l->b, l->n, 0), sh = s->ts, stage = "task"; }
+    if (m < 0 && s->fs) { m = module_binding_missing(s->fs, l->b, l->n, off_fs), sh = s->fs, stage = "fragment"; }
+    if (m >= 0) {
+        const uint8_t *k = gfx_shader_key(sh);
+        snprintf(why, cap, "the %s shader (key %02x%02x%02x%02x%02x%02x%02x%02x) uses binding %d, which its reflection and layout lack",
+                 stage, k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7], m);
+    }
+    return m < 0;
 }
 
 // Checks both stages of a graphics pipeline against its layout; 0 with why filled when one uses a missing binding.
@@ -1500,6 +1516,7 @@ static Pipe *pipe_add(const void *key, size_t size, uint64_t h, VkPipeline pipel
 
 typedef struct {                       // normalized: zero where the state is dynamic or unused
     const GfxShader *vs, *fs;
+    const GfxShader *ts, *mesh;        // task and mesh stages: mesh set makes this a mesh pipeline
     uint32_t color[8], depth, stencil; // VkFormat
     uint8_t n_color, samples, topo_class, minus_w;
     uint8_t clamp, poly_mode, a2c, logic_op;   // logic_op: VkLogicOp + 1 when enabled
@@ -1557,7 +1574,7 @@ uint32_t vk_pipeline_target_wmask(const VkPipeState *s, int i) { return target_w
 
 static void gkey_fill(const VkPipeState *s, GKey *k) {
     memset(k, 0, sizeof *k);
-    k->vs = s->vs, k->fs = s->fs;
+    k->vs = s->vs, k->fs = s->fs, k->ts = s->ts, k->mesh = s->mesh;
     k->indep = (uint8_t)P.indep;
     k->n_color = (uint8_t)target_count(s);
     for (int i = 0; i < k->n_color; i++) k->color[i] = target_format(s->color_fmt[i], NULL, NULL);
@@ -1622,7 +1639,131 @@ static uint32_t vs_union_missing(const VkPipeState *s, GfxShaderIo fin[32]) {
     return missing;
 }
 
+// A mesh pipeline's stage layout: the task stage (if any) keeps the translator's binding numbers, the mesh stage's
+// move by off_ms and the fragment stage's by off_fs, as the ordinary graphics path moves the fragment stage's.
+static void mesh_stage_offsets(const VkPipeState *s, uint32_t *off_ms, uint32_t *off_fs) {
+    uint32_t span_ts = s->ts ? binding_span(s->ts) : 0;
+    uint32_t span_ms = binding_span(s->mesh);
+    *off_ms = s->ts ? span_ts - 1 : 0;
+    *off_fs = *off_ms + span_ms - 1;
+}
+
+// A task/mesh pipeline, built monolithically (graphics pipeline libraries do not take mesh stages): the task stage
+// optional, the mesh stage required, the fragment stage as on any draw. There is no vertex input and no input
+// assembly; the output topology and the vertex count come from the mesh shader's execution modes.
+static VkPipeline create_mesh_graphics(const VkPipeState *s, const GKey *k, const Layout *l) {
+    uint32_t off_ms, off_fs;
+    mesh_stage_offsets(s, &off_ms, &off_fs);
+
+    VkShaderModule tm = VK_NULL_HANDLE, mm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE;
+    uint32_t *mpatched = NULL, *fpatched = NULL;
+    uint64_t mw;
+    const uint32_t *mcode = gfx_shader_spirv(s->mesh, &mw);
+
+    if (off_ms) {
+        uint64_t n2 = 0;
+        mpatched = spirv_rebind(mcode, mw, off_ms);
+        if (mpatched) mcode = mpatched, mw = n2;
+        else LOG_ONCE("vk_pipeline: cannot move the mesh stage's bindings by %u", off_ms);
+    }
+    mm = make_module(mcode, mw);
+    if (s->ts) {
+        uint64_t tw;
+        const uint32_t *tcode = gfx_shader_spirv(s->ts, &tw);
+        tm = make_module(tcode, tw);
+    }
+    if (s->fs) {
+        uint64_t fw;
+        const uint32_t *fcode = gfx_shader_spirv(s->fs, &fw);
+        if (k->dsb) {
+            uint64_t n2 = 0;
+            uint32_t *d = spirv_dual_source(fcode, fw, &n2);
+            if (d) fcode = fpatched = d, fw = n2;
+            else LOG_ONCE("vk_pipeline: SRC1 blend factors but the fragment shader writes no colour output 1");
+        }
+        if (l->set1 || off_fs) {
+            uint32_t *r = !fcode ? NULL : l->set1 ? spirv_set(fcode, fw, 1) : spirv_rebind(fcode, fw, off_fs);
+            free(fpatched);
+            fcode = fpatched = r;
+        }
+        if (fcode) fm = make_module(fcode, fw);
+    }
+    VkPipeline pipe = VK_NULL_HANDLE;
+    if (!mm || (s->ts && !tm) || (s->fs && !fm)) goto out;
+
+    VkPipelineShaderStageCreateInfo stages[3];
+    uint32_t nstage = 0;
+    if (tm) stages[nstage++] = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                                 .stage = VK_SHADER_STAGE_TASK_BIT_EXT, .module = tm, .pName = "main"};
+    stages[nstage++] = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                         .stage = VK_SHADER_STAGE_MESH_BIT_EXT, .module = mm, .pName = "main"};
+    if (fm) stages[nstage++] = (VkPipelineShaderStageCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                                 .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fm, .pName = "main"};
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rq[3];
+    uint64_t sw;
+    pin_subgroup32(&stages[tm ? 1 : 0], &rq[0], gfx_shader_spirv(s->mesh, &sw), sw);
+    if (s->fs) pin_subgroup32(&stages[nstage - 1], &rq[1], gfx_shader_spirv(s->fs, &sw), sw);
+
+    VkPipelineViewportDepthClipControlCreateInfoEXT clip = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT,
+                                                            .negativeOneToOne = k->minus_w};
+    VkPipelineViewportStateCreateInfo vp = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .pNext = &clip};
+    VkPipelineRasterizationProvokingVertexStateCreateInfoEXT pvs = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT,
+        .provokingVertexMode = VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT};
+    VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                                                 .pNext = P.pv_last ? &pvs : NULL,
+                                                 .depthClampEnable = k->clamp, .polygonMode = (VkPolygonMode)k->poly_mode,
+                                                 .lineWidth = 1.0f};
+    VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                                               .rasterizationSamples = (VkSampleCountFlagBits)k->samples,
+                                               .alphaToCoverageEnable = k->a2c};
+    VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+                                                .maxDepthBounds = 1.0f};
+    VkPipelineColorBlendAttachmentState cba[8];
+    memset(cba, 0, sizeof cba);
+    for (int i = 0; i < k->n_color; i++) {
+        const uint8_t *b = k->blend[i];
+        cba[i].blendEnable = k->blend_en >> i & 1;
+        cba[i].srcColorBlendFactor = (VkBlendFactor)b[0], cba[i].dstColorBlendFactor = (VkBlendFactor)b[1];
+        cba[i].colorBlendOp = (VkBlendOp)b[2], cba[i].srcAlphaBlendFactor = (VkBlendFactor)b[3];
+        cba[i].dstAlphaBlendFactor = (VkBlendFactor)b[4], cba[i].alphaBlendOp = (VkBlendOp)b[5];
+        cba[i].colorWriteMask = k->wmask >> (4 * i) & 0xf;
+    }
+    VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+                                              .logicOpEnable = k->logic_op != 0,
+                                              .logicOp = k->logic_op ? (VkLogicOp)(k->logic_op - 1) : VK_LOGIC_OP_COPY,
+                                              .attachmentCount = k->n_color, .pAttachments = cba};
+    VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+                                           .dynamicStateCount = P.n_dyn, .pDynamicStates = P.dyn};
+    VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = k->n_color,
+                                        .pColorAttachmentFormats = (const VkFormat *)k->color,
+                                        .depthAttachmentFormat = (VkFormat)k->depth, .stencilAttachmentFormat = (VkFormat)k->stencil};
+    VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri,
+                                       .stageCount = nstage, .pStages = stages, .pVertexInputState = NULL,
+                                       .pInputAssemblyState = NULL, .pViewportState = &vp, .pRasterizationState = &rs,
+                                       .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb,
+                                       .pDynamicState = &dy, .layout = l->layout};
+    if (k->fbl & 1) pi.flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+    if (k->fbl & 2) pi.flags |= VK_PIPELINE_CREATE_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+    uint64_t p0 = perf_begin();
+    VkResult r = vkCreateGraphicsPipelines(P.device, P.cache, 1, &pi, NULL, &pipe);
+    perf_end(PERF_PIPE, p0);
+    if (r != VK_SUCCESS) {
+        rt_log("vk_pipeline: vkCreateGraphicsPipelines (task/mesh) failed (%d)", (int)r);
+        pipe = VK_NULL_HANDLE;
+    } else {
+        perf_count(PERF_CNT_PIPE_BUILT);
+    }
+out:
+    if (tm) vkDestroyShaderModule(P.device, tm, NULL);
+    if (mm) vkDestroyShaderModule(P.device, mm, NULL);
+    if (fm) vkDestroyShaderModule(P.device, fm, NULL);
+    free(mpatched), free(fpatched);
+    return pipe;
+}
+
 static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Layout *l, uint32_t fs_off) {
+    if (s->mesh) return create_mesh_graphics(s, k, l);
     VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE;
     uint64_t vw, fw;
     const uint32_t *vcode = gfx_shader_spirv(s->vs, &vw);
@@ -2236,15 +2377,16 @@ static int seen_add(uint64_t h) {
 
 static void rec_fill(KeyRec *r, const VkPipeState *s) {
     memset(r, 0, sizeof *r);
-    memcpy(r->vs, gfx_shader_input_id(s->vs), 32);
+    if (s->vs) memcpy(r->vs, gfx_shader_input_id(s->vs), 32);
     if (s->fs) memcpy(r->fs, gfx_shader_input_id(s->fs), 32), r->has_fs = 1;
     r->s = *s;
-    r->s.vs = r->s.fs = NULL;
+    r->s.vs = r->s.fs = r->s.ts = r->s.mesh = NULL;
     r->s.prim_restart = 0;   // dynamic state: the same pipeline either way
 }
 
 // A pipeline was built for a draw: queue its record for the file. Caller holds P.lock.
 static void keys_note(const VkPipeState *s) {
+    if (s->mesh) return;   // task/mesh pipelines are not recorded for the prewarm yet (no vertex stage to key on)
     if (!A.on || !K.path[0]) return;
     KeyRec r;
     rec_fill(&r, s);
@@ -2487,7 +2629,62 @@ static void promote(Pipe *p) {
 
 // Enters a missing pipeline: built here (mode 0), or queued for a draw (1) or for the prebuild (2). Failures are
 // entered too. *queued: 1 when a job owns it. Caller holds P.lock.
+// A task/mesh pipeline: a monolithic build (no graphics pipeline library), its layout over the task, mesh and
+// fragment stages in that order.
+static Pipe *pipe_miss_mesh(const VkPipeState *s, const GKey *k, uint64_t h, int mode, int *queued) {
+    *queued = 0;
+    const char *why = NULL;
+    Bindings B = {0};
+    Layout *l = NULL;
+    uint32_t off_ms, off_fs;
+    mesh_stage_offsets(s, &off_ms, &off_fs);
+    if (gfx_shader_stage(s->mesh) != GFX_STAGE_MS ||
+        (s->ts && gfx_shader_stage(s->ts) != GFX_STAGE_TS) ||
+        (s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS)) why = "stage mismatch";
+    else if (!add_stage(&B, s->mesh, off_ms) || (s->ts && !add_stage(&B, s->ts, 0)) ||
+             (s->fs && !add_stage(&B, s->fs, off_fs))) why = "too many bindings";
+    else if (!(l = layout_get(&B))) why = "descriptor layout creation failed";
+    char lack[128];
+    if (!why && !layout_covers_mesh(s, l, off_ms, off_fs, lack, sizeof lack)) why = lack, l = NULL;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    Job *j = NULL;
+    if (!why && mode && workers_start() && (j = calloc(1, sizeof *j))) {
+        *j = (Job){.l = l, .fs_off = off_fs, .low = mode == 2, .prebuild = mode == 2, .worker = -1, .s = *s, .k = *k};
+    } else if (!why && !(pipe = create_mesh_graphics(s, k, l))) {
+        why = "pipeline creation failed";
+    }
+    if (why) {
+        P.stats.failures++;
+        rt_log("vk_pipeline: task/mesh pipeline not built: %s", why);
+    } else if (!j) {
+        P.stats.graphics++;
+    }
+    Pipe *p = pipe_add(k, sizeof *k, h, pipe, l, l ? &B : NULL, VK_PIPELINE_BIND_POINT_GRAPHICS, 0);
+    if (!j || !p) {
+        free(j);
+        return p;
+    }
+    j->p = p;
+    p->building = 1, p->job = j;
+    if (mode == 2) {
+        j->prev = A.low_tail;
+        if (A.low_tail) A.low_tail->next = j;
+        else A.low = j;
+        A.low_tail = j;
+        K.left++;
+    } else {
+        if (A.tail) A.tail->next = j;
+        else A.head = j;
+        A.tail = j;
+    }
+    A.inflight++;
+    WakeConditionVariable(&work_cv);
+    *queued = 1;
+    return p;
+}
+
 static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode, int *queued) {
+    if (s->mesh) return pipe_miss_mesh(s, k, h, mode, queued);
     *queued = 0;
     const char *why = NULL;
     Bindings B = {0};
@@ -2614,7 +2811,7 @@ static void lib_wait(const VkPipeState *s, const GKey *k, Layout *l, double end)
 static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int async, int *pending, uint32_t wait_ms) {
     if (info) *info = NULL;
     if (pending) *pending = 0;
-    if (!s->vs || !ensure_init()) return VK_NULL_HANDLE;
+    if ((!s->vs && !s->mesh) || !ensure_init()) return VK_NULL_HANDLE;
     GKey k;
     gkey_fill(s, &k);
     uint64_t h = key_hash(&k, sizeof k);
@@ -2641,7 +2838,7 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
                       : "builds its libraries itself (OOT_PIPE_WAIT=draw)");
     }
     double end = wait_ms ? now_ms() + wait_ms : 0;
-    if (p && p->building && P.gpl && !p->info.pipeline && !p->fast_tried && p->lay) {
+    if (p && p->building && P.gpl && !p->info.pipeline && !p->fast_tried && p->lay && !s->mesh) {
         int final = 0, build = wait_ms != 0 && draw_build;
         uint64_t p0 = perf_begin(), t0 = qpc();
         if (build && U.on) {

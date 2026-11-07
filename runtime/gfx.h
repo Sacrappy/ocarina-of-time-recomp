@@ -28,7 +28,7 @@ double gfx_window_refresh_hz(void);                        // refresh rate of th
 int gfx_window_focused(void);
 
 // ---- shader service client (gfx_shader.c)
-enum { GFX_STAGE_VS, GFX_STAGE_TCS, GFX_STAGE_TES, GFX_STAGE_GS, GFX_STAGE_FS, GFX_STAGE_CS };
+enum { GFX_STAGE_VS, GFX_STAGE_TCS, GFX_STAGE_TES, GFX_STAGE_GS, GFX_STAGE_FS, GFX_STAGE_CS, GFX_STAGE_TS, GFX_STAGE_MS };
 enum { GFX_TEX_1D = 1, GFX_TEX_1D_ARRAY, GFX_TEX_BUFFER, GFX_TEX_2D, GFX_TEX_2D_ARRAY, GFX_TEX_2D_MS,
        GFX_TEX_2D_MS_ARRAY, GFX_TEX_3D, GFX_TEX_CUBE, GFX_TEX_CUBE_ARRAY,   // gfx_shader.c tex_names order (low 4 bits)
        GFX_TEX_UINT = 0x10, GFX_TEX_SINT = 0x20 };   // tex_type flags: the texture's format is integer (the translator
