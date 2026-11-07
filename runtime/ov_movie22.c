@@ -494,6 +494,32 @@ static int free_frame(const Dec *d) {
     return -1;
 }
 
+// OOT_MOVIE_PPM=<file.ppm> (debug): the decoded NV12 frame as RGB (BT.709 limited) after a few frames, to tell a
+// decoder/plane problem from a texture-path problem in the striped cinematics.
+static void dump_ppm(const uint8_t *nv12, int w, int h) {
+    const char *path = getenv("OOT_MOVIE_PPM");
+    static int seen;
+    if (!path || !*path) return;
+    if (++seen < 3 || seen > 5) return;   // the first pictures can be black
+    size_t ysz = (size_t)w * h;
+    const uint8_t *uv = nv12 + ysz;
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fprintf(f, "P6\n%d %d\n255\n", w, h);
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            double Y = 1.164 * (nv12[(size_t)y * w + x] - 16);
+            double U = uv[(size_t)(y / 2) * w + (x & ~1)] - 128.0;
+            double V = uv[(size_t)(y / 2) * w + (x & ~1) + 1] - 128.0;
+            double r = Y + 1.792 * V, g = Y - 0.213 * U - 0.533 * V, b = Y + 2.112 * U;
+            uint8_t o[3] = {(uint8_t)(r < 0 ? 0 : r > 255 ? 255 : r), (uint8_t)(g < 0 ? 0 : g > 255 ? 255 : g),
+                            (uint8_t)(b < 0 ? 0 : b > 255 ? 255 : b)};
+            fwrite(o, 1, 3, f);
+        }
+    fclose(f);
+    rt_log("movie22: wrote %s (%dx%d)", path, w, h);
+}
+
 // A decoded picture into the game's frame buffer: Y, then interleaved UV, tight rows.
 static int fill_frame(Cpu *c, Dec *d, uint64_t frame, const Dav1dPicture *pic) {
     uint8_t *buf = (uint8_t *)(uintptr_t)LD64(frame + 0x8);
@@ -512,6 +538,7 @@ static int fill_frame(Cpu *c, Dec *d, uint64_t frame, const Dav1dPicture *pic) {
     uint8_t *uv = buf + ysz;                                 // the game reads two planes: Y, then UV interleaved (NV12)
     for (int y = 0; y < ch; y++, u += pic->stride[1], v += pic->stride[1], uv += 2 * cw)
         for (int x = 0; x < cw; x++) uv[2 * x] = u[x], uv[2 * x + 1] = v[x];
+    dump_ppm(buf, w, h);
     rt_call(c, G.set_plane, 4, frame, U(buf), (uint64_t)ysz, 0ull);
     rt_call(c, G.set_plane, 4, frame, U(buf + ysz), (uint64_t)(2 * csz), 1ull);
     rt_call(c, G.set_plane, 4, frame, 0ull, 0ull, 2ull);
