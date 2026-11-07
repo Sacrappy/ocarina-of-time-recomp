@@ -491,7 +491,7 @@
          /// <summary>
 --- /dev/null
 +++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMesh.cs
-@@ -0,0 +1,341 @@
+@@ -0,0 +1,386 @@
 +using System;
 +using Ryujinx.Graphics.Shader.Decoders;
 +using Ryujinx.Graphics.Shader.IntermediateRepresentation;
@@ -664,10 +664,11 @@
 +
 +            context.Barrier();
 +
-+            // OOT_MESH_EMPTY=1 (diagnostic; the translator reads it, so translate with a fresh shader cache): the
-+            // workgroup announces no vertices and writes nothing, which tells a fault in the output writes from one
-+            // in the shader's own body.
-+            if (Environment.GetEnvironmentVariable("OOT_MESH_EMPTY") == "1")
++            // OOT_MESH_EMPTY (diagnostic; the translator reads it, so translate with a fresh OOT_SHADER_CACHE):
++            //   1: the workgroup announces no vertices and writes nothing (the shader body alone);
++            //   2: vertices written, no primitive indices and a zero primitive count (the vertex outputs alone).
++            string mode = Environment.GetEnvironmentVariable("OOT_MESH_EMPTY") ?? "";
++            if (mode == "1")
 +            {
 +                if (definitions.Stage == ShaderStage.Mesh)
 +                {
@@ -678,7 +679,7 @@
 +
 +            if (definitions.Stage == ShaderStage.Mesh)
 +            {
-+                EmitMeshOutputs(context, definitions, stageId);
++                EmitMeshOutputs(context, definitions, stageId, mode);
 +            }
 +            else
 +            {
@@ -686,8 +687,13 @@
 +            }
 +        }
 +
-+        private static void EmitMeshOutputs(EmitterContext context, ShaderDefinitions definitions, int stageId)
++        private static void EmitMeshOutputs(EmitterContext context, ShaderDefinitions definitions, int stageId,
++                                            string mode)
 +        {
++            bool noPrimitives = mode == "2";
++            bool fixedPrimitive = mode == "3";   // announce and draw one fixed triangle, no map read
++            bool fixedIndices = mode == "4";     // the game's count, every primitive is (0,1,2)
++            bool fewPrimitives = mode == "5";    // the game's indices, at most 8 primitives
 +            Operand threadId = context.Load(StorageKind.Input, IoVariable.ThreadId, null, Const(0));
 +
 +            // The primitive count as a byte at MAP + 3 (see Isbe: MAP.32 only has a meaningful low byte).
@@ -698,6 +704,19 @@
 +
 +            // A count above the mesh's declared maximum is undefined in Vulkan (and takes the device down): clamp it.
 +            primitives = context.IMinimumU32(primitives, Const(definitions.MaxMeshOutputPrimitives));
++
++            if (noPrimitives)
++            {
++                primitives = Const(0);
++            }
++            else if (fixedPrimitive)
++            {
++                primitives = Const(1);
++            }
++            else if (fewPrimitives)
++            {
++                primitives = context.IMinimumU32(primitives, Const(8));
++            }
 +
 +            context.MeshSetOutputs(Const(definitions.MaxOutputVertices), primitives);
 +
@@ -763,34 +782,60 @@
 +                context.MarkLabel(lblOutOfRange);
 +            }
 +
-+            // Every lane takes the primitives it wrote: p = lane, lane + workgroup size, ...
-+            Operand primitive = Local();
-+            Operand lblHead = Label();
-+            Operand lblDone = Label();
++            if (noPrimitives)
++            {
++                return;
++            }
 +
-+            context.Copy(primitive, threadId);
-+            context.MarkLabel(lblHead);
-+            context.BranchIfTrue(lblDone, context.ICompareGreaterOrEqualUnsigned(primitive, primitives));
++            if (fixedPrimitive)
++            {
++                Operand lblNotFirst = Label();
++                context.BranchIfFalse(lblNotFirst, context.ICompareEqual(threadId, Const(0)));
++                context.MeshSetPrimitive(Const(0), Const(0), Const(1), Const(2));
++                context.MarkLabel(lblNotFirst);
++                return;
++            }
 +
-+            Operand indices = context.IMultiply(primitive, Const(3));
-+            indices = context.IAdd(indices, Const(definitions.MeshStageMapBase + 4));
++            // Every lane takes the primitives it wrote: p = lane, lane + workgroup size, ... Unrolled: a hand-built
++            // loop's counter loses its increment in the AST optimizer (the mesh shader spun for ever and the device
++            // was lost), and the maximum primitive count bounds the number of steps anyway.
++            int primitiveSteps = (definitions.MaxMeshOutputPrimitives + workgroup - 1) / workgroup;
 +
-+            Operand i0 = LoadMapByte(context, stageId, indices, 0);
-+            Operand i1 = LoadMapByte(context, stageId, indices, 1);
-+            Operand i2 = LoadMapByte(context, stageId, indices, 2);
++            for (int step = 0; step < primitiveSteps; step++)
++            {
++                Operand primitive = step == 0 ? threadId : context.IAdd(threadId, Const(step * workgroup));
++                Operand lblInRange = Label();
 +
-+            // A vertex index at or above the declared vertex count is undefined in Vulkan and can take the device
-+            // down; the game's own indices are below maxV, so this only guards a bad stage buffer.
-+            Operand lastVertex = Const(definitions.MaxOutputVertices - 1);
-+            i0 = context.IMinimumU32(i0, lastVertex);
-+            i1 = context.IMinimumU32(i1, lastVertex);
-+            i2 = context.IMinimumU32(i2, lastVertex);
++                context.BranchIfFalse(lblInRange, context.ICompareLessUnsigned(primitive, primitives));
 +
-+            context.MeshSetPrimitive(primitive, i0, i1, i2);
++                Operand indices = context.IMultiply(primitive, Const(3));
++                indices = context.IAdd(indices, Const(definitions.MeshStageMapBase + 4));
 +
-+            context.Copy(primitive, context.IAdd(primitive, Const(workgroup)));
-+            context.Branch(lblHead);
-+            context.MarkLabel(lblDone);
++                Operand i0, i1, i2;
++                if (fixedIndices)
++                {
++                    i0 = Const(0);
++                    i1 = Const(1);
++                    i2 = Const(2);
++                }
++                else
++                {
++                    i0 = LoadMapByte(context, stageId, indices, 0);
++                    i1 = LoadMapByte(context, stageId, indices, 1);
++                    i2 = LoadMapByte(context, stageId, indices, 2);
++                }
++
++                // A vertex index at or above the declared vertex count is undefined in Vulkan and can take the device
++                // down; the game's own indices are below maxV, so this only guards a bad stage buffer.
++                Operand lastVertex = Const(definitions.MaxOutputVertices - 1);
++                i0 = context.IMinimumU32(i0, lastVertex);
++                i1 = context.IMinimumU32(i1, lastVertex);
++                i2 = context.IMinimumU32(i2, lastVertex);
++
++                context.MeshSetPrimitive(primitive, i0, i1, i2);
++
++                context.MarkLabel(lblInRange);
++            }
 +        }
 +
 +        private static Operand LoadMapByte(EmitterContext context, int stageId, Operand baseAddress, int add)
@@ -806,23 +851,23 @@
 +        {
 +            int words = definitions.MeshPayloadSize >> 2;
 +
-+            // Every lane moves the payload words it wrote into the payload variable the mesh stage reads.
++            // Every lane moves the payload words it wrote into the payload variable the mesh stage reads. Unrolled for
++            // the same reason as the primitive copy (a hand-built loop's counter is lost by the AST optimizer).
 +            if (words > 0 && payloadId >= 0)
 +            {
 +                Operand threadId = context.Load(StorageKind.Input, IoVariable.ThreadId, null, Const(0));
-+                Operand index = Local();
-+                Operand lblHead = Label();
-+                Operand lblDone = Label();
++                int workgroup = Math.Max(1, definitions.ComputeLocalSizeX);
++                int payloadSteps = (words + workgroup - 1) / workgroup;
 +
-+                context.Copy(index, threadId);
-+                context.MarkLabel(lblHead);
-+                context.BranchIfTrue(lblDone, context.ICompareGreaterOrEqualUnsigned(index, Const(words)));
++                for (int step = 0; step < payloadSteps; step++)
++                {
++                    Operand index = step == 0 ? threadId : context.IAdd(threadId, Const(step * workgroup));
++                    Operand lblInRange = Label();
 +
-+                context.MeshStorePayload(index, context.Load(StorageKind.SharedMemory, payloadId, index));
-+
-+                context.Copy(index, context.IAdd(index, Const(Math.Max(1, definitions.ComputeLocalSizeX))));
-+                context.Branch(lblHead);
-+                context.MarkLabel(lblDone);
++                    context.BranchIfFalse(lblInRange, context.ICompareLessUnsigned(index, Const(words)));
++                    context.MeshStorePayload(index, context.Load(StorageKind.SharedMemory, payloadId, index));
++                    context.MarkLabel(lblInRange);
++                }
 +            }
 +
 +            // The mesh workgroup count, written at TASK + 4 by one lane (Isbe stores it at the stage buffer's word 1).

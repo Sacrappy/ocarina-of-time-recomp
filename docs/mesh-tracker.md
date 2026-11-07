@@ -171,3 +171,12 @@ B4 or a direct job file), then a mesh pipeline (D2) with the paired fragment sha
   probe, a hand-made minimal mesh pipeline drawn into an offscreen target, to iterate without the level; then bisect
   the epilogue (vertices only vs primitives only).
 
+- 2026-11-08 (night): **the device loss was an infinite loop**. The epilogue's primitive loop was built with an IR
+  local as its counter, and the AST optimizer dropped the increment (the generated SPIR-V loads the counter, never
+  stores it), so every mesh workgroup whose primitive count was not zero spun until the GPU watchdog killed the
+  context. Bisected with `OOT_MESH_EMPTY`: 1 (announce nothing) survives, 2 (vertices, no primitives) survives,
+  3 (one fixed primitive) survives, 4 (the game's primitive count, fixed indices) and 5 (at most 8 primitives) both
+  lose the device. The runtime's fault report names the faulting submission's part (`vk: device fault address N:
+  instruction pointer (unknown) at ...`) and `OOT_LOG_MS=1` timestamps every log line (the loss comes seconds after
+  the draw, the driver's timeout). Both epilogue loops (primitive indices, task payload) are now unrolled; the
+  maximum counts bound the step count (126 primitives / 32 = 4 steps; 12 KiB payload / 32 = 96).

@@ -86,8 +86,13 @@ void rt_logf(const char *fmt, ...) {
 }
 
 void rt_log(const char *fmt, ...) {
+    // OOT_LOG_MS=1 prefixes every line with the process's uptime in ms: enough to tell a GPU hang (the driver's
+    // ~2 s timeout) from an immediate fault when a draw loses the device.
+    static int with_ms = -1;
+    if (with_ms < 0) with_ms = getenv("OOT_LOG_MS") != NULL;
     char buf[2048];
-    int n = snprintf(buf, sizeof buf, "[host] ");
+    int n = with_ms ? snprintf(buf, sizeof buf, "[%llu] [host] ", (unsigned long long)GetTickCount64())
+                    : snprintf(buf, sizeof buf, "[host] ");
     va_list ap;
     va_start(ap, fmt);
     int k = vsnprintf(buf + n, sizeof buf - n - 1, fmt, ap);
