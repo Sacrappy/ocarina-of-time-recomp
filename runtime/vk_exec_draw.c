@@ -2903,6 +2903,43 @@ static int skip_cs(const GfxShader *cs) {
     return skip;
 }
 
+// A skipped compute dispatch leaves its storage images as they were. A fresh target holds uninitialised memory, and a
+// NaN in the volumetric fog volume poisons every lighting and tonemapping pass that samples it, so zero the images the
+// kernel would store into (its store flag is Ryujinx's TextureUsageFlags image-store bit). Diagnostic aid for
+// OOT_SKIP_CS, not a substitute for a correct kernel.
+static void skip_zero_images(VkExec *ex, const GfxShader *cs) {
+    const GfxShaderRes *res;
+    int n = gfx_shader_resources(cs, GFX_RES_IMG, &res), ended = 0;
+    int st = nvn_stage_of(NVN_STAGE_CS);
+    for (int i = 0; i < n; i++) {
+        const GfxShaderRes *r = &res[i];
+        if (!(r->flags & 4)) continue;
+        int count = r->count ? r->count : 1;
+        for (int k = 0; k < count; k++) {
+            int slot = r->slot + k;
+            if (slot < 0 || slot >= 32) continue;
+            uint64_t h = ex->img[st][slot];
+            if (!h) continue;
+            vk_texture_lock();
+            const VkTexImage *img = vk_texture_by_id_locked((int)(h & 0xfffff), NULL, NULL);
+            if (img) {
+                if (!ended) vk_exec_pass_end(ex), vk_exec_barrier(ex), ended = 1;
+                VkImageSubresourceRange rng = {img->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+                if (img->aspect & VK_IMAGE_ASPECT_COLOR_BIT) {
+                    VkClearColorValue cv = {0};
+                    vkCmdClearColorImage(ex->cb, img->image, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &rng);
+                } else {
+                    VkClearDepthStencilValue dv = {0, 0};
+                    vkCmdClearDepthStencilImage(ex->cb, img->image, VK_IMAGE_LAYOUT_GENERAL, &dv, 1, &rng);
+                }
+                ex->recorded++;
+                vk_texture_gpu_written_id((int)(h & 0xfffff));
+            }
+            vk_texture_unlock();
+        }
+    }
+}
+
 static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (d->x <= 0 || d->y <= 0 || d->z <= 0) return;
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
@@ -2926,7 +2963,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
         }
         return;
     }
-    if (skip_cs(cs)) return;
+    if (skip_cs(cs)) { skip_zero_images(ex, cs); return; }
     const VkPipeInfo *info = NULL;
     VkPipeline p = vk_pipeline_compute(cs, &info);
     if (!p || !info) return warn_once(W_PIPELINE, "a compute pipeline could not be created: dispatches with it are skipped");
