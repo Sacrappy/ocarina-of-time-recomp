@@ -317,6 +317,30 @@ static uint32_t block_inner(RtThread *t, int kind, int64_t ns) {
     return t->wres;
 }
 
+// OOT_SEM_LOG=<hex address> (diagnostic): every WaitForAddress / SignalToAddress on that address, with the guest
+// caller. The movie path's light semaphores are built on those two SVCs, so this names the job behind a wait.
+static void sem_log(const char *op, Cpu *c, uint64_t addr, uint64_t v) {
+    static int on = -1;
+    static uint64_t want;
+    if (on < 0) {
+        const char *e = cfg_get("OOT_SEM_LOG");
+        on = e && *e ? 1 : 0;
+        want = on ? strtoull(e, NULL, 16) : 0;
+    }
+    if (!on || addr != want) return;
+    // Only the events that break a quiet stretch (30 ms): a stall is a gap, and the log has to reach the slow window.
+    static uint64_t last;
+    static volatile LONG n;
+    uint64_t now = kern_now_ns();
+    uint64_t gap = last ? now - last : 0;
+    last = now;
+    if (gap < 30000000ull || InterlockedIncrement(&n) > 400) return;
+    char d[160];
+    rt_logf("sem: %s %#llx %#llx by %#x after a %.1f ms gap, at %s\n", op, (unsigned long long)addr,
+            (unsigned long long)v, tcur ? tcur->handle : 0, gap / 1e6, ldr_describe(c->x[30], d, sizeof d));
+    kern_backtrace(c);
+}
+
 // ---- virtual cores
 // Horizon runs at most one thread per core, and TotK keys per-core data (allocators, job queues) by the current core
 // number without locks. A guest thread therefore holds one of the three application cores while it runs guest code
@@ -833,10 +857,12 @@ static void thread_dump(uint64_t frame) {
                 ldr_describe(t->entry, e, sizeof e));
         rt_logf("  last woken by thread %#x; blocks %llu; spin passes %llu at %#llx\n", t->waker, (unsigned long long)t->nblk,
                 (unsigned long long)t->sp_n, (unsigned long long)t->sp_site);
-        if (t->cur && t->cur_core < 0) {
+        if (t->cur) {
             const char *h = hostfn_name(t->cur->pc);   // in a host call: pc is that host function's slot
             char d[160];
             rt_logf("  pc %s\n", h ? h : ldr_describe(t->cur->pc, d, sizeof d));
+            // A running thread's guest frame chain is live; the read can tear, but it is the only way to see what a
+            // busy worker is running (OOT_THREAD_DUMP during a stall).
             kern_backtrace(t->cur);
         }
         host_stack_log((DWORD)t->tid);
@@ -2023,6 +2049,7 @@ int kern_svc(Cpu *c, uint32_t imm) {
         uint64_t addr = x[0];
         int type = (int)x[1];
         int32_t val = (int32_t)x[2];
+        sem_log("wait", c, addr, (uint64_t)(uint32_t)val);
         if (type < 0 || type > 3) {
             x[0] = R_INVALID_ENUM;
             return 1;
@@ -2050,6 +2077,7 @@ int kern_svc(Cpu *c, uint32_t imm) {
                    // 2 if equal modify by the number of waiters
         uint64_t addr = x[0];
         int type = (int)x[1], cnt = (int)x[3];
+        sem_log("signal", c, addr, x[2]);
         int32_t val = (int32_t)x[2];
         if (type < 0 || type > 2) {
             x[0] = R_INVALID_ENUM;
