@@ -3219,6 +3219,13 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d) {
     if (!on) return;
     if (!ex->prog) return warn_once(W_PROGRAM, "a mesh draw without a bound program is skipped");
     if (!mesh_fns() || !prepare_mesh(ex)) return;
+    // OOT_MESH_BIND=1 (diagnostic): the pass, the mesh pipeline, its state and its descriptors are bound, but no draw
+    // is issued: tells a pipeline/state fault from the mesh shader's execution.
+    {
+        static int bind_only = -1;
+        if (bind_only < 0) bind_only = cfg_get("OOT_MESH_BIND") && *cfg_get("OOT_MESH_BIND") == '1';
+        if (bind_only) return;
+    }
     {
         static volatile LONG shown;
         if (InterlockedIncrement(&shown) <= 3)

@@ -491,7 +491,7 @@
          /// <summary>
 --- /dev/null
 +++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMesh.cs
-@@ -0,0 +1,324 @@
+@@ -0,0 +1,341 @@
 +using System;
 +using Ryujinx.Graphics.Shader.Decoders;
 +using Ryujinx.Graphics.Shader.IntermediateRepresentation;
@@ -552,6 +552,9 @@
 +            }
 +
 +            address = baseAddress == 0 ? address : context.IAdd(address, Const(baseAddress));
++            // A shared-memory index outside the declared array is undefined and some drivers fault on it: the game's
++            // address register is data (vertex and primitive indices, ranks), so clamp the stage buffer's byte address.
++            address = context.IMinimumU32(address, Const(definitions.MeshStageBufferSize - 1));
 +
 +            if (!op.Write)
 +            {
@@ -606,7 +609,8 @@
 +
 +                // Without a payload variable the task space is the first words of the stage buffer (0: workgroup
 +                // index, 4: count), filled by EmitStart and by Isbe's own writes.
-+                Operand word = context.ShiftRightU32(address, Const(2));
++                Operand word = context.ShiftRightU32(
++                    context.IMinimumU32(address, Const(definitions.MeshStageBufferSize - 1)), Const(2));
 +                context.Copy(GetDest(op.Dest), context.Load(StorageKind.SharedMemory, stageId, word));
 +                return;
 +            }
@@ -628,7 +632,8 @@
 +            }
 +            else
 +            {
-+                Operand word = context.ShiftRightU32(address, Const(2));
++                Operand word = context.ShiftRightU32(
++                    context.IMinimumU32(address, Const(definitions.MeshStageBufferSize - 1)), Const(2));
 +                context.Store(StorageKind.SharedMemory, stageId, word, GetSrcReg(context, op.Dest));
 +            }
 +        }
@@ -658,6 +663,18 @@
 +            }
 +
 +            context.Barrier();
++
++            // OOT_MESH_EMPTY=1 (diagnostic; the translator reads it, so translate with a fresh shader cache): the
++            // workgroup announces no vertices and writes nothing, which tells a fault in the output writes from one
++            // in the shader's own body.
++            if (Environment.GetEnvironmentVariable("OOT_MESH_EMPTY") == "1")
++            {
++                if (definitions.Stage == ShaderStage.Mesh)
++                {
++                    context.MeshSetOutputs(Const(0), Const(0));
++                }
++                return;
++            }
 +
 +            if (definitions.Stage == ShaderStage.Mesh)
 +            {
