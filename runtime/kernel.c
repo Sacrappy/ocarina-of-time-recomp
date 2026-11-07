@@ -246,12 +246,13 @@ static void wake_log(RtThread *t) {
     if (waited < 100000000ull) return;
     static volatile LONG said;
     if (InterlockedIncrement(&said) > 2000) return;
-    char w[128] = "-", s[128] = "-";
+    char w[128] = "-", s[128] = "-", c[128] = "-";
     if (t->cur && t->cur->pc) ldr_describe(t->cur->pc, w, sizeof w);
     if (tcur && tcur->cur && tcur->cur->pc) ldr_describe(tcur->cur->pc, s, sizeof s);
-    rt_log("kern: %#x waited %.1f ms on %s %#llx, signalled by %#x at %s", t->handle, waited / 1e6,
+    if (tcur && tcur->cur && tcur->cur->x[30]) ldr_describe(tcur->cur->x[30], c, sizeof c);   // the caller: the job that finished
+    rt_log("kern: %#x waited %.1f ms on %s %#llx, signalled by %#x at %s (from %s)", t->handle, waited / 1e6,
            t->wkind == W_ADDRESS ? "address" : t->wkind == W_CONDVAR ? "condvar" : t->wkind == W_SYNC ? "sync" : "lock",
-           (unsigned long long)(t->wkind == W_SYNC ? t->wobj : t->waddr), tcur ? tcur->handle : 0, s);
+           (unsigned long long)(t->wkind == W_SYNC ? t->wobj : t->waddr), tcur ? tcur->handle : 0, s, c);
     rt_log("kern:   waiter was at %s", w);
 }
 

@@ -745,7 +745,37 @@ static int handle_source(uint64_t h, HANDLE *f, uint64_t *base, uint64_t *size) 
     return 1;
 }
 
+// The whole guest-visible read, both the mapped memcpy and the ReadFile path: the first playback of a movie faults
+// its pages in here, and the guest's extractor thread blocks for the duration.
+static void romfs_note(uint64_t ns, uint64_t n) {
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static uint64_t t0, calls, bytes, total_ns, max_ns, slow;
+    if (!(rt_trace & RT_TRACE_FS)) return;
+    AcquireSRWLockExclusive(&lock);
+    uint64_t now = kern_now_ns();
+    if (!t0) t0 = now;
+    calls++, bytes += n, total_ns += ns;
+    if (ns > max_ns) max_ns = ns;
+    if (ns > 2000000) slow++;
+    if (now - t0 >= 5000000000ull) {
+        rt_log("fs: romfs %llu reads, %.1f MiB, %.1f ms in the read, %llu over 2 ms (slowest %.2f ms) in %.1f s",
+               (unsigned long long)calls, bytes / 1048576.0, total_ns / 1e6, (unsigned long long)slow, max_ns / 1e6,
+               (now - t0) / 1e9);
+        t0 = now, calls = bytes = total_ns = max_ns = slow = 0;
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
+
+static uint32_t romfs_read_inner(uint64_t *out, uint64_t h, int64_t offset, void *buffer, uint64_t size);
+
 uint32_t romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buffer, uint64_t size) {
+    uint64_t r0 = kern_now_ns();
+    uint32_t rr = romfs_read_inner(out, h, offset, buffer, size);
+    romfs_note(kern_now_ns() - r0, (rr == 0 && out) ? *out : 0);
+    return rr;
+}
+
+static uint32_t romfs_read_inner(uint64_t *out, uint64_t h, int64_t offset, void *buffer, uint64_t size) {
     HANDLE f;
     uint64_t base, fsize;
     if (rt_trace & RT_TRACE_FS) {   // the first reads of a run, one line each: which file, where and how much
