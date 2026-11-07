@@ -500,7 +500,9 @@ static void dump_ppm(const uint8_t *nv12, int w, int h) {
     const char *path = getenv("OOT_MOVIE_PPM");
     static int seen;
     if (!path || !*path) return;
-    if (++seen < 3 || seen > 5) return;   // the first pictures can be black
+    const char *at = getenv("OOT_MOVIE_PPM_AT");
+    int want = at && *at ? atoi(at) : 3;   // the first pictures can be black; OOT_MOVIE_PPM_AT picks another
+    if (++seen < want || seen > want + 2) return;
     size_t ysz = (size_t)w * h;
     const uint8_t *uv = nv12 + ysz;
     FILE *f = fopen(path, "wb");
