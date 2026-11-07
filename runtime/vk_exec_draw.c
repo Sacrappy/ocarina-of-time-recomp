@@ -2249,6 +2249,13 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
                         if (dummy_cs < 0) dummy_cs = getenv("OOT_CS_DUMMY_TEX") != NULL;
                         if (dummy_cs && st == NVN_STAGE_CS && !img) h = 0;
                     }
+                    if ((st == NVN_STAGE_MS || st == NVN_STAGE_TS) && b->kind == GFX_RES_TEX) {
+                        static volatile LONG said;
+                        if (InterlockedIncrement(&said) <= 16)
+                            rt_log("vk: %s texture slot %d (binding %u) -> handle %#llx, program %llu",
+                                   st == NVN_STAGE_MS ? "mesh" : "task", slot, (unsigned)b->binding,
+                                   (unsigned long long)h, ex->prog ? (unsigned long long)ex->prog->serial : 0ull);
+                    }
                     tex_info(ex, r, h, img, r->separate, &o[k].image);
                     o[k].w[2] = (uint32_t)o[k].image.imageLayout;   // zero the tail padding
                     // an image the shader stores into: marked written after the lock is released (below)
