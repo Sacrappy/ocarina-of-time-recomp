@@ -496,6 +496,10 @@ static uint64_t shader_hash(const GfxShader *s) {
     const uint32_t *w = gfx_shader_spirv(s, &words);
     const uint8_t *b = (const uint8_t *)w;
     for (uint64_t i = 0; i < words * 4; i++) h = (h ^ b[i]) * 0x100000001b3ull;
+    {   // the input id, so a dump's sh_<hash>.spv can be matched with a res.json / OOT_SKIP_FS
+        const uint8_t *id = gfx_shader_input_id(s);
+        rt_log("vk_dump: shader %016llx is input id %02x%02x%02x%02x", (unsigned long long)h, id[0], id[1], id[2], id[3]);
+    }
     char path[600];
     snprintf(path, sizeof path, "%s/sh_%016llx.spv", dir, (unsigned long long)h);
     FILE *f = fopen(path, "wb");

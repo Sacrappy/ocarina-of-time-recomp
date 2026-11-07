@@ -2523,6 +2523,30 @@ static int pipe_memo_on(void) {
 }
 
 // Pass, shaders, pipeline, fixed state and resources for a draw. 0: the draw is skipped.
+// OOT_SKIP_FS=<hex>[,...] (diagnostic): draws whose fragment shader's input id starts with one of the prefixes are
+// not recorded. Logs each shader it skips once.
+static int skip_fs(const GfxShader *fs) {
+    const char *e = getenv("OOT_SKIP_FS");
+    if (!e || !*e) return 0;
+    char hex[17];
+    const uint8_t *id = gfx_shader_input_id(fs);
+    for (int i = 0; i < 8; i++) snprintf(hex + 2 * i, 3, "%02x", id[i]);
+    int listed = 0;
+    for (const char *p = e; *p && !listed;) {
+        size_t n = strcspn(p, ",");
+        if (n && n <= 16 && !strncmp(hex, p, n)) listed = 1;
+        p += n + (p[n] == ',');
+    }
+    if (listed) {
+        static char seen[64][17];
+        static int nseen;
+        int known = 0;
+        for (int i = 0; i < nseen && !known; i++) known = !strcmp(seen[i], hex);
+        if (!known && nseen < 64) strcpy(seen[nseen++], hex), rt_log("vk_exec: OOT_SKIP_FS: draws of %s skipped", hex);
+    }
+    return listed;
+}
+
 static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     if (ex->render_disabled) return 0;
     cb_res(ex);
@@ -2567,6 +2591,10 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         if (vs_wait) vs = shader_for(ex, NVN_STAGE_VS, &has_vs, NULL, 1);
         if (fs_wait) fs = shader_for(ex, NVN_STAGE_FS, &has_fs, NULL, 1);
     }
+    // OOT_SKIP_FS=<hex>[,...] (diagnostic): draws whose fragment shader input id starts with a prefix are not
+    // recorded, as if the shader had failed. The level's 15 depth-sliced atmosphere draws (the white haze over the
+    // distance) were found this way with the frame dump.
+    if (fs && skip_fs(fs)) return perf_count(PERF_CNT_SHADER_SKIP), 0;
     if (!vs || (has_fs && !fs)) {
         if (vk_dump_armed) {   // which program the draw needed, by the code hash tools/kernel.py prints
             char hv[2][17] = {"-", "-"};
