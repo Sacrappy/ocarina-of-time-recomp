@@ -324,6 +324,11 @@ static void make_dummy(int i, VkFormat fmt, VkImage *image, VmaAllocation *alloc
     VkCommandBuffer cb = vk_upload_begin();
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &bar};
     vkCmdPipelineBarrier2(cb, &di);
+    // A stand-in is what a missing texture resolves to: leave it uninitialised and the object flashes whatever the
+    // driver left in the 1x1 (white on this GPU). Zero it, so a miss reads transparent black and never flashes.
+    VkClearColorValue zero = {0};
+    VkImageSubresourceRange rng = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, dinfo[i].layers};
+    vkCmdClearColorImage(cb, *image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &rng);
     vk_upload_end();
 }
 
@@ -1686,7 +1691,15 @@ static void pool_resolve(VkExec *ex, PoolSet *p, int id, uint32_t mask) {
     view_t v;
     int hv;
     const VkTexImage *img = vk_texture_live_by_id_locked(p->tbase + id, &v, &hv);
-    p->recheck[id] = img ? (img->mirrored && !img->gpu_owned) : p->tok[id] ? 2 : 0;   // 2: stale or not yet creatable
+    if (!img && p->tok[id]) {
+        // Resolved before and momentarily not live (the game finalizes and re-registers its streamed textures): keep
+        // the last views instead of writing the stand-in, or every such object flashes white/black for the frames in
+        // between. Released images stay alive until the pool is done with them, which the retention below guarantees;
+        // when the slot is registered again the token moves and the id is resolved normally.
+        p->recheck[id] = 2;   // retry on a later epoch
+        return;
+    }
+    p->recheck[id] = img ? (img->mirrored && !img->gpu_owned) : 0;
     PST.resolves++;
     for (int b = 1; b < GFX_POOL_BINDINGS; b++) {
         if (!(mask >> b & 1)) continue;
