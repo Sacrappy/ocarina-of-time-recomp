@@ -1145,10 +1145,48 @@ static uint32_t *spirv_add_xfb(const uint32_t *w, uint64_t n, uint64_t *out_n) {
     return o;
 }
 
+// OOT_FLOAT_PRESERVE=1 (diagnostic): declare SignedZeroInfNanPreserve for 32-bit floats in the module. Without it the
+// driver may fold, flush or reorder Inf/NaN (x*0 -> 0, denormals to zero), which changes what a kernel that already
+// sits on a division by zero produces. Inserted as OpCapability 4422 and OpExecutionMode 4461 on the entry point; the
+// device enables shaderSignedZeroInfNanPreserveFloat32 when the driver reports it.
+static uint32_t *spirv_float_preserve(const uint32_t *w, uint64_t words, uint64_t *out_words) {
+    static int on = -1;
+    if (on < 0) on = cfg_bool("OOT_FLOAT_PRESERVE");
+    if (!on || words < 8) return NULL;
+    uint32_t entry = 0;
+    uint64_t cap_end = 5, entry_end = 0, mode_end = 0, i = 5;
+    for (; i + 1 <= words;) {
+        uint32_t ins = w[i], op = ins & 0xffffu, n = ins >> 16;
+        if (!n || i + n > words) return NULL;
+        if (op == 17) { if (cap_end == i) cap_end = i + n; }          // OpCapability run at the top
+        else if (op == 15) { if (n > 2) entry = w[i + 2]; entry_end = i + n; }   // OpEntryPoint
+        else if (op == 16) mode_end = i + n;                           // OpExecutionMode
+        i += n;
+    }
+    if (!entry) return NULL;
+    uint64_t at_mode = mode_end ? mode_end : entry_end;
+    if (!at_mode) return NULL;
+    uint32_t *o = malloc((size_t)(words + 6) * 4);
+    if (!o) return NULL;
+    uint64_t k = 0;
+    memcpy(o, w, (size_t)cap_end * 4), k = cap_end;                   // header + capabilities
+    o[k++] = (17u << 16) | 2u, o[k++] = 4422u;                        // OpCapability SignedZeroInfNanPreserve
+    memcpy(o + k, w + cap_end, (size_t)(at_mode - cap_end) * 4), k += at_mode - cap_end;
+    o[k++] = (16u << 16) | 4u, o[k++] = entry, o[k++] = 4461u, o[k++] = 32u;   // OpExecutionMode ... 32
+    memcpy(o + k, w + at_mode, (size_t)(words - at_mode) * 4), k += words - at_mode;
+    *out_words = k;
+    static volatile LONG said;
+    if (InterlockedIncrement(&said) <= 4) rt_log("vk_pipeline: SignedZeroInfNanPreserve added (%llu -> %llu words)", (unsigned long long)words, (unsigned long long)k);
+    return o;
+}
+
 static VkShaderModule make_module(const uint32_t *w, uint64_t words) {
     uint64_t fixed_n = 0;
     uint32_t *fixed = spirv_fixup(w, words, &fixed_n);
     if (fixed) w = fixed, words = fixed_n;
+    uint64_t pres_n = 0;
+    uint32_t *pres = spirv_float_preserve(w, words, &pres_n);
+    if (pres) { free(fixed); fixed = pres, words = pres_n; }
     VkShaderModuleCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = (size_t)words * 4, .pCode = w};
     VkShaderModule m = VK_NULL_HANDLE;
     VkResult r = vkCreateShaderModule(P.device, &ci, NULL, &m);

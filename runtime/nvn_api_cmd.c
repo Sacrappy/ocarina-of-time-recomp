@@ -750,10 +750,19 @@ static void bind_buffers(const Cpu *c, uint32_t op) {   // (cmd, stage, first, n
 // DIAG (NVN2 bank 0 layout): the compute stage's bindings and the start of a bound uniform buffer, a few times.
 static void bind_log(const char *what, int st, int first, int n, uint64_t a, uint64_t b) {
     static volatile LONG lines;
-    if ((st != 5 && !(what[0] == 'u' && st <= 1)) || !getenv("OOT_BIND_LOG") || gfx_stats().frames < 290) return;
+    static uint64_t from = 290, cap = 240;
+    static int parsed;
+    if (!parsed) {
+        parsed = 1;
+        const char *e = getenv("OOT_BIND_LOG_FROM");
+        if (e && *e) from = strtoull(e, NULL, 10);
+        const char *c = getenv("OOT_BIND_LOG");
+        if (c && *c >= '0' && *c <= '9') cap = strtoull(c, NULL, 10);   // a number instead of 1: that many lines
+    }
+    if ((st != 5 && !(what[0] == 'u' && st <= 1)) || !getenv("OOT_BIND_LOG") || gfx_stats().frames < from) return;
     if (what[0] == 'u' && b == 0x100 && a && !*(const uint64_t *)(uintptr_t)a) return;   // the engine's dummy block, every frame
     if (what[0] == 't' && a == 0x10200102) return;                                       // the dummy texture
-    if (InterlockedIncrement(&lines) > 240) return;
+    if (InterlockedIncrement(&lines) > (LONG)cap) return;
     rt_log("bindlog: f%llu %s stage %d slot %d n %d %#llx %#llx", (unsigned long long)gfx_stats().frames, what, st, first, n,
            (unsigned long long)a, (unsigned long long)b);
     if (what[0] == 'u' && a && b >= 0x100 && *(const uint64_t *)(uintptr_t)a) {

@@ -54,23 +54,32 @@ static int create_instance(void) {
     // buffer and image accesses and names an out-of-bounds store (slow; for a device loss the breadcrumbs cannot place).
     const char *ve = cfg_get("OOT_VK_VALIDATION");
     int validate = cfg_bool("OOT_VK_VALIDATION"), gpu_assisted = ve && !strcmp(ve, "gpu");
+    // OOT_VK_SYNC=1 (or OOT_VK_VALIDATION=sync): synchronization validation on top of the core checks: it reports
+    // missing barriers and read-after-write hazards a compute kernel can see as garbage.
+    int sync_val = cfg_bool("OOT_VK_SYNC") || (ve && !strcmp(ve, "sync"));
+    if (sync_val) validate = 1;
     if (gpu_assisted) validate = 1;
     if (validate && !layer_present(layers[0])) {
         rt_log("vk: OOT_VK_VALIDATION set but %s is not installed; continuing without", layers[0]);
         validate = gpu_assisted = 0;
     }
     if (validate) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
-    if (gpu_assisted) ext[n_ext++] = VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME;
-    VkValidationFeatureEnableEXT gpu_en[] = {VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT,
-                                             VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_RESERVE_BINDING_SLOT_EXT};
-    VkValidationFeaturesEXT vf = {.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT, .enabledValidationFeatureCount = 2,
-                                  .pEnabledValidationFeatures = gpu_en};
+    if (gpu_assisted || sync_val) ext[n_ext++] = VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME;
+    VkValidationFeatureEnableEXT en[3] = {VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT,
+                                          VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_RESERVE_BINDING_SLOT_EXT,
+                                          VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT};
+    int n_en = 0;
+    if (gpu_assisted) n_en = 2;
+    else if (sync_val) en[0] = VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT, n_en = 1;
+    VkValidationFeaturesEXT vf = {.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT, .enabledValidationFeatureCount = (uint32_t)n_en,
+                                  .pEnabledValidationFeatures = en};
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "TotK Recomp",
                              .pEngineName = "TotK Recomp", .apiVersion = VK_API_VERSION_1_3};
-    VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pNext = gpu_assisted ? &vf : NULL,
+    VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pNext = (gpu_assisted || sync_val) ? &vf : NULL,
                                .pApplicationInfo = &app, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext,
                                .enabledLayerCount = validate ? 1 : 0, .ppEnabledLayerNames = layers};
     if (gpu_assisted) rt_log("vk: OOT_VK_VALIDATION=gpu: GPU-assisted validation on");
+    if (sync_val) rt_log("vk: synchronization validation on");
     rdoc_init();
     VkResult r = vkCreateInstance(&ci, NULL, &g_vk.instance);
     if (r != VK_SUCCESS) { rt_log("vk: vkCreateInstance failed (%d); is a Vulkan 1.3 driver installed?", (int)r); return 0; }

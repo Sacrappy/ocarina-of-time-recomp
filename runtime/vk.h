@@ -238,6 +238,7 @@ void vk_mem_snap_stats(uint64_t *checks, uint64_t *calls, uint64_t *untracked); 
 // OOT_FIX_ZERO (default 1): physical pools are zeroed once at creation and GPU-only images with memory of their own
 // are cleared when created; 0 leaves both as the driver hands them out.
 int vk_fix_zero(void);
+int vk_zero_every_image(void);   // OOT_ZERO_GPU_MEM: clear every image at creation, aliased or not
 VkCommandBuffer vk_upload_begin(void);
 void vk_upload_end(void);
 void *vk_staging(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc);

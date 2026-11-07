@@ -217,7 +217,20 @@ int vk_fix_zero(void) {
     static int on = -1;
     if (on < 0) {
         on = cfg_bool("OOT_FIX_ZERO");
+        // OOT_ZERO_GPU_MEM=1 (diagnostic): zero every GPU buffer and image this back end creates, not only the
+        // GPU-only ones OOT_FIX_ZERO covers. A NaN that a compute kernel writes out of memory the game never
+        // initialised disappears if the memory starts at zero.
+        if (cfg_bool("OOT_ZERO_GPU_MEM")) {
+            rt_log("vk: OOT_ZERO_GPU_MEM: every GPU buffer and image starts zeroed");
+            on = 1;
+        }
     }
+    return on;
+}
+
+int vk_zero_every_image(void) {   // OOT_ZERO_GPU_MEM: also clear images that would otherwise keep their contents
+    static int on = -1;
+    if (on < 0) on = cfg_bool("OOT_ZERO_GPU_MEM");
     return on;
 }
 
