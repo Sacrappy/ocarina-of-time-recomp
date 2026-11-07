@@ -204,6 +204,7 @@ typedef struct {
     VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT fbl;
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lr;
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop;
+    VkPhysicalDeviceMeshShaderFeaturesEXT mesh;
 } FeatureChain;
 
 static int create_device(void) {
@@ -237,6 +238,8 @@ static int create_device(void) {
     OPTIONAL_EXT(has_device_fault, VK_EXT_DEVICE_FAULT_EXTENSION_NAME, fault, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT);
     // Tensor cores for the lowered HMMA (sm86_lower.c lower_hmma): subgroup matrices, compute only.
     OPTIONAL_EXT(has_coopmat, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME, coop, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR);
+    // Task and mesh shaders (docs/mesh.md): the game draws much of its scene with them.
+    OPTIONAL_EXT(has_mesh_shader, VK_EXT_MESH_SHADER_EXTENSION_NAME, mesh, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT);
     // Ryujinx's SPIR-V declares fragment shader interlock whenever the host reports it (vk_pipeline.c spirv_fixup).
     OPTIONAL_EXT(has_fragment_shader_interlock, VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME, fsi,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT);
@@ -268,6 +271,21 @@ static int create_device(void) {
     // The driver fills the chain with what it supports; the same chain then enables all of it (robustBufferAccess
     // stays on: guest shaders index constant buffers freely and out-of-range reads must stay harmless).
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &c->f2);
+    if (g_vk.has_mesh_shader) {
+        // Per-primitive shading rates need VK_KHR_fragment_shading_rate, which is not enabled: off, or device creation
+        // fails. Both stages or neither.
+        c->mesh.primitiveFragmentShadingRateMeshShader = VK_FALSE;
+        if (!c->mesh.taskShader || !c->mesh.meshShader) g_vk.has_mesh_shader = 0;
+        if (!c->f11.multiview) c->mesh.multiviewMeshShader = VK_FALSE;
+        VkPhysicalDeviceMeshShaderPropertiesEXT mp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &mp};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
+        rt_log("vk: mesh shaders %s: task and mesh workgroups up to %u and %u invocations, mesh outputs up to %u vertices "
+               "and %u primitives, task payload %u bytes, mesh shared memory %u bytes",
+               g_vk.has_mesh_shader ? "on" : "off (task or mesh stage missing)", mp.maxTaskWorkGroupInvocations,
+               mp.maxMeshWorkGroupInvocations, mp.maxMeshOutputVertices, mp.maxMeshOutputPrimitives,
+               mp.maxTaskPayloadSize, mp.maxMeshSharedMemorySize);
+    }
     vk_caps_driver(g_vk.phys);
     vk_caps_features(&c->f2.features);
     if (gpl_link) {

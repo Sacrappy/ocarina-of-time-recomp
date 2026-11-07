@@ -6,11 +6,13 @@
 // nvnp_<name> is the implementation of one proc: the weak definitions here stop with the proc's name, nvn_api_*.c
 // and nvn_ext.c define the strong ones. The name list is runtime/nvn_procs.inc (tools/gen_nvn_procs.py).
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
 
 #include "gfx.h"
+#include "cfg.h"
 #include "host.h"
 
 // The strong nvnp_nvnDeviceGetProcAddress below replaces the stand-in generated for the same row.
@@ -30,16 +32,38 @@
 #undef nvnp_nvnDeviceGetProcAddress
 void nvnp_nvnDeviceGetProcAddress(Cpu *c);
 
-// NVN2 names the game loads that have no implementation (nvn_procs_stub.inc): a stub logs its first three calls with
-// the caller and the first arguments and returns 0, so the game runs on and the log shows which procs it uses.
+// NVN2 names the game loads that have no implementation (nvn_procs_stub.inc): a stub logs its first calls with the
+// caller and the first arguments (three, or OOT_STUB_LOG of them), and its call count at every power of two from
+// 1024, and returns 0, so the game runs on and the log shows which procs it uses and how often. For an *Indirect
+// proc it also prints the 16 bytes at x1 when they are readable (the indirect arguments as the CPU sees them then).
+static int stub_log_n(void) {
+    static int n = -1;
+    if (n < 0) {
+        const char *e = cfg_get("OOT_STUB_LOG");
+        n = e && *e ? atoi(e) : 3;
+    }
+    return n;
+}
+static void stub_log(const char *name, Cpu *c, long k) {
+    char at[128], peek[80] = "";
+    if (strstr(name, "Indirect")) {
+        MEMORY_BASIC_INFORMATION mi;
+        const uint32_t *p = (const uint32_t *)(uintptr_t)c->x[1];
+        if (VirtualQuery(p, &mi, sizeof mi) && mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
+            (const uint8_t *)p + 16 <= (const uint8_t *)mi.BaseAddress + mi.RegionSize)
+            snprintf(peek, sizeof peek, "; [x1] %08x %08x %08x %08x", p[0], p[1], p[2], p[3]);
+    }
+    rt_log("nvn2 stub %s #%ld from %s: x0 %#llx x1 %#llx x2 %#llx x3 %#llx x4 %#llx x5 %#llx%s (returns 0)", name, k,
+           ldr_describe(c->x[30] - 4, at, sizeof at), (unsigned long long)c->x[0], (unsigned long long)c->x[1],
+           (unsigned long long)c->x[2], (unsigned long long)c->x[3], (unsigned long long)c->x[4],
+           (unsigned long long)c->x[5], peek);
+}
 #define NVN_STUB(n)                                                                                                  \
     static void nvnp_stub_##n(Cpu *c) {                                                                               \
         static volatile LONG seen;                                                                                   \
         LONG k = InterlockedIncrement(&seen);                                                                         \
-        char at[128];                                                                                                \
-        if (k <= 3) rt_log("nvn2 stub " #n " from %s: x0 %#llx x1 %#llx x2 %#llx x3 %#llx (returns 0)",                \
-                           ldr_describe(c->x[30] - 4, at, sizeof at), (unsigned long long)c->x[0],                      \
-                           (unsigned long long)c->x[1], (unsigned long long)c->x[2], (unsigned long long)c->x[3]);      \
+        if (k >= 1024 && !(k & (k - 1))) rt_log("nvn2 stub " #n ": %ld calls", (long)k);                              \
+        if (k <= stub_log_n()) stub_log(#n, c, k);                                                                    \
         ret_x(c, 0);                                                                                                 \
     }
 #include "nvn_procs_stub.inc"

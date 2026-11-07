@@ -924,7 +924,7 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
         case OP_SET_SAMP_POOL: ex->samp_pool = ((const p_set_pool *)a)->pool; break;
         case OP_BARRIER: vk_exec_barrier(ex); break;
         case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH: case OP_UPDATE_UB: case OP_DRAW_IDX_IND: case OP_DISPATCH_IND:
-        case OP_DRAW_IND: case OP_PUSH_CC:
+        case OP_DRAW_IND: case OP_PUSH_CC: case OP_DRAW_MESH:
             if (h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND || h->op == OP_DRAW_IND) vk_exec_frame.draws_seen++, split_draws++;
             if (h->op == OP_DISPATCH || h->op == OP_DISPATCH_IND) vk_exec_frame.dispatches++, split_draws++;
             if (h->op != OP_UPDATE_UB && !ex->in_pass && vk_crumbs_ops() && ex->cb) {   // OOT_CRUMBS=ops: what a device loss names

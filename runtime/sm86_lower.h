@@ -45,3 +45,12 @@ int sm86_control_parse(const uint8_t *control, uint32_t control_size, Sm86Contro
 #define SM86_CONTROL_MAGIC 0x98761234u
 #define SM86_CONTROL_MIN 0xe0u    // the fixed part; the jump-table records follow it
 #define SM86_HEADER 0x80u         // the program header before a graphics stage's first instruction
+// Task and mesh programs (docs/mesh.md): two pseudo instructions in Maxwell encodings no Maxwell instruction uses (top
+// byte 0x6c and 0x6d; Ryujinx's InstTable has nothing there), which a translator patch decodes.
+// SM86_ISBE_OP: the stage buffer, ISBERD or ISBEWR: bits 0-7 the register read into or written, 8-15 the address
+// register, 16-19 the guard, 20-43 the byte offset, 44-47 the space (0xf ATTR, 7 TASK, 1 MAP.32, 0 MAP.U8), 48 a write.
+// SM86_MESH_EPILOGUE: where every EXIT of the program branches (sm86_lower.c lower_exit), before the final EXIT: the
+// translator emits the stage's end there (EmitMeshTasks for a task program, SetMeshOutputs and the output copy for a
+// mesh program).
+#define SM86_ISBE_OP 0x6c00000000000000ull
+#define SM86_MESH_EPILOGUE 0x6d00000000070000ull

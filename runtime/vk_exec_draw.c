@@ -3096,6 +3096,24 @@ static void ind_log(VkExec *ex, const VkMemSpan *ip, const GfxShader *cs) {
 
 // DispatchComputeIndirect: vkCmdDispatchIndirect from the pool buffer. The shader reads the group counts from c0 0x200,
 // so they are copied there on the GPU, into a c0 range no other dispatch uses, before the dispatch.
+// Mesh tasks (docs/mesh.md, docs/mesh-tracker.md D3): recorded, not drawn yet. Counted (logged at powers of two from
+// 256) and noted in a frame dump with the bound program and the pass they fall in, so a dump shows where the scene's
+// mesh-shader geometry goes.
+static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d) {
+    static volatile LONG direct, indirect;
+    LONG k = InterlockedIncrement(d->ind ? &indirect : &direct);
+    if (k >= 256 && !(k & (k - 1)))
+        rt_log("vk_exec: %ld %s mesh-task draws met, none drawn yet", (long)k, d->ind ? "indirect" : "direct");
+    if (d->ind)
+        vk_dump_note("mesh draw skipped (not replayed yet): indirect record at %#llx, program %llu, %s pass %ux%u",
+                     (unsigned long long)d->ind, ex->prog ? (unsigned long long)ex->prog->serial : 0ull,
+                     ex->in_pass ? "in" : "outside a", ex->pass_w, ex->pass_h);
+    else
+        vk_dump_note("mesh draw skipped (not replayed yet): workgroups %u from %u, program %llu, %s pass %ux%u", d->count,
+                     d->first, ex->prog ? (unsigned long long)ex->prog->serial : 0ull, ex->in_pass ? "in" : "outside a",
+                     ex->pass_w, ex->pass_h);
+}
+
 static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
     VkMemSpan ip;
@@ -3336,6 +3354,7 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     case OP_DRAW_IDX_IND: op_draw_idx_ind(ex, payload); break;
     case OP_DRAW_IND: op_draw_ind(ex, payload); break;
     case OP_DISPATCH_IND: op_dispatch_ind(ex, payload); ex->push_cc_len = 0; break;
+    case OP_DRAW_MESH: op_draw_mesh(ex, payload); break;
     default: rt_fatal("vk: op %s is not a draw op", nvn_op_name(op));
     }
 }

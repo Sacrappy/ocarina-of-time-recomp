@@ -47,6 +47,23 @@ def bits(words, offset, count):
     return (v >> (offset % 32)) & ((1 << count) - 1)
 
 
+# The stage buffer ops of task and mesh programs (docs/mesh.md), as read from captured programs (2026-11-07; not in
+# Mesa NAK's encoder): Rd (ISBERD) at 16-23, the address register at 24-31, the byte offset in w1 >> 8, ISBEWR's data
+# register in w1 & 0xff, the space by bits 75-78: 0xf ATTR (the workgroup index at 0; vertex outputs, a 0x80-byte
+# line per component), 7 TASK (the task's output: the mesh workgroup count at 4, the payload from 0x10), 1 MAP.32 (the
+# primitive count at 3), 0 MAP.U8 (vertex indices from 4). The names are working ones.
+ISBE_SPACE = {0xf: 'ATTR', 0x7: 'TASK', 0x1: 'MAP.32', 0x0: 'MAP.U8'}
+
+
+def isbe(w, base):
+    ra = bits(w, 24, 8)
+    addr = 'RZ' if ra == 255 else f'R{ra}'
+    space = ISBE_SPACE.get(bits(w, 75, 4), f'space{bits(w, 75, 4):x}')
+    if base == 0x123:
+        return f'ISBERD.{space:<6} R{bits(w, 16, 8)}, [{addr} + {w[1] >> 8:#x}]'
+    return f'ISBEWR.{space:<6} [{addr} + {w[1] >> 8:#x}], R{w[1] & 0xff}  b79 {bits(w, 79, 1)}'
+
+
 def listing(code, start, end, origin=0):
     lines = []
     for o in range(start, end - (end - start) % 16, 16):
@@ -60,8 +77,10 @@ def listing(code, start, end, origin=0):
         imm = w[1]
         cb = f'c[{bits(w, 54, 5)}][{bits(w, 38, 16):#x}]'
         src1 = f'{imm:#x}' if form in ('I', 'xI') else cb if form in ('C', 'xC') else f'UR{bits(w, 32, 6)}' if form in ('U', 'xU') else f'R{rb}'
-        lines.append(f'{origin + o:06x} {p}{name:<10} {form:<2} R{rd:<3} R{ra:<3} {src1:<14} R{rc:<3} '
-                     f'{w[0]:08x} {w[1]:08x} {w[2]:08x} {w[3]:08x}')
+        text = f'{name:<10} {form:<2} R{rd:<3} R{ra:<3} {src1:<14} R{rc:<3}'
+        if op & 0x1ff in (0x123, 0x127):
+            text = isbe(w, op & 0x1ff).ljust(len(text))
+        lines.append(f'{origin + o:06x} {p}{text} {w[0]:08x} {w[1]:08x} {w[2]:08x} {w[3]:08x}')
     return lines
 
 
