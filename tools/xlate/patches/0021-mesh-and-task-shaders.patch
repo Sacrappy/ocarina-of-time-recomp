@@ -106,10 +106,10 @@
 +                context.PrimitiveTriangleIndices = variable;
 +            }
 +
-+            // A task stage always has a payload variable (OpEmitMeshTasksEXT names one); a mesh stage of a task
-+            // pipeline needs it to read what the task wrote.
-+            if (definitions.Stage == ShaderStage.Task ||
-+                (definitions.Stage == ShaderStage.Mesh && definitions.MeshPayloadSize > 0))
++            // Every task and mesh stage declares the payload variable: a task stage needs one for
++            // OpEmitMeshTasksEXT, and the two stages of a pipeline must declare the same type (Vulkan compares them).
++            // The size comes from the control section, which holds the same value in a pipeline's two stages.
++            if (definitions.IsMeshOrTask)
 +            {
 +                int words = Math.Max(1, (definitions.MeshPayloadSize + 3) / 4);
 +                SpvInstruction arrayType = context.TypeArray(context.TypeU32(), context.Constant(context.TypeU32(), words));
@@ -137,19 +137,46 @@
                  {
                      SpvInstruction perVertexInputStructType = CreatePerVertexStructType(context);
                      int arraySize = context.Definitions.Stage == ShaderStage.Geometry ? context.Definitions.InputTopology.InputVertexCount : 32;
-@@ -460,6 +506,11 @@
-                 if (context.Definitions.Stage == ShaderStage.TessellationControl)
-                 {
+@@ -462,6 +508,11 @@
                      int arraySize = context.Definitions.ThreadsPerInputPrimitive;
-+                    perVertexOutputArrayType = context.TypeArray(perVertexOutputStructType, context.Constant(context.TypeU32(), arraySize));
-+                }
+                     perVertexOutputArrayType = context.TypeArray(perVertexOutputStructType, context.Constant(context.TypeU32(), arraySize));
+                 }
 +                else if (context.Definitions.Stage == ShaderStage.Mesh)
 +                {
 +                    int arraySize = context.Definitions.MaxOutputVertices;
-                     perVertexOutputArrayType = context.TypeArray(perVertexOutputStructType, context.Constant(context.TypeU32(), arraySize));
-                 }
++                    perVertexOutputArrayType = context.TypeArray(perVertexOutputStructType, context.Constant(context.TypeU32(), arraySize));
++                }
                  else
-@@ -630,7 +681,12 @@
+                 {
+                     perVertexOutputArrayType = perVertexOutputStructType;
+@@ -479,6 +530,26 @@
+         {
+             SpvInstruction vec4FloatType = context.TypeVector(context.TypeFP32(), 4);
+             SpvInstruction floatType = context.TypeFP32();
++
++            if (context.Definitions.Stage == ShaderStage.Mesh)
++            {
++                // A mesh shader writes vertices, not whole gl_PerVertex records: Position only. Unwritten members
++                // (point size, clip and cull distances) would otherwise be declared for every vertex.
++                SpvInstruction meshBlockType = context.TypeStruct(true, vec4FloatType);
++
++                context.Name(meshBlockType, "gl_PerVertex");
++                context.MemberName(meshBlockType, 0, "gl_Position");
++                context.Decorate(meshBlockType, Decoration.Block);
++
++                if (context.HostCapabilities.ReducedPrecision)
++                {
++                    context.MemberDecorate(meshBlockType, 0, Decoration.Invariant);
++                }
++
++                context.MemberDecorate(meshBlockType, 0, Decoration.BuiltIn, (LiteralInteger)BuiltIn.Position);
++
++                return meshBlockType;
++            }
+             SpvInstruction array8FloatType = context.TypeArray(context.TypeFP32(), context.Constant(context.TypeU32(), 8));
+             SpvInstruction array1FloatType = context.TypeArray(context.TypeFP32(), context.Constant(context.TypeU32(), 1));
+ 
+@@ -630,7 +701,12 @@
                  };
              }
  
@@ -464,7 +491,7 @@
          /// <summary>
 --- /dev/null
 +++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMesh.cs
-@@ -0,0 +1,317 @@
+@@ -0,0 +1,324 @@
 +using System;
 +using Ryujinx.Graphics.Shader.Decoders;
 +using Ryujinx.Graphics.Shader.IntermediateRepresentation;
@@ -559,16 +586,20 @@
 +                if (definitions.MeshPayloadSize > 0 && definitions.Stage == ShaderStage.Mesh)
 +                {
 +                    // A mesh program of a task pipeline reads the payload the task wrote, and 0 is its workgroup
-+                    // index (the hardware's own value, not part of the payload).
-+                    if (op.Offset < 0x10)
++                    // index (the hardware's own value, not part of the payload). The payload word is at ra + offset
++                    // from 0x10 (the task shader writes at rank * stride + 0x10), clamped to the declared size.
++                    if (op.Offset < 0x10 && op.SrcA == RegisterConsts.RegisterZeroIndex)
 +                    {
-+                        context.Copy(GetDest(op.Dest), op.Offset == 0 && op.SrcA == RegisterConsts.RegisterZeroIndex
++                        context.Copy(GetDest(op.Dest), op.Offset == 0
 +                            ? context.Load(StorageKind.Input, IoVariable.CtaId, null, Const(0))
 +                            : Const(0));
 +                    }
 +                    else
 +                    {
-+                        context.Copy(GetDest(op.Dest), context.MeshLoadPayload(Const((op.Offset - 0x10) >> 2)));
++                        Operand payloadWord = context.ShiftRightU32(context.ISubtract(address, Const(0x10)), Const(2));
++                        int payloadWords = Math.Max(1, definitions.MeshPayloadSize >> 2);
++                        context.Copy(GetDest(op.Dest), context.MeshLoadPayload(
++                            context.IMinimumU32(payloadWord, Const(payloadWords - 1))));
 +                    }
 +                    return;
 +                }
@@ -584,7 +615,10 @@
 +
 +            if (op.Offset >= 0x10 && definitions.MeshPayloadSize > 0 && payloadId >= 0)
 +            {
-+                context.Store(StorageKind.SharedMemory, payloadId, Const((op.Offset - 0x10) >> 2),
++                // The payload word is at ra + offset from 0x10 (a task writing several payloads uses rank * stride).
++                Operand payloadWord = context.ShiftRightU32(context.ISubtract(address, Const(0x10)), Const(2));
++                int payloadWords = Math.Max(1, definitions.MeshPayloadSize >> 2);
++                context.Store(StorageKind.SharedMemory, payloadId, context.IMinimumU32(payloadWord, Const(payloadWords - 1)),
 +                              GetSrcReg(context, op.Dest));
 +            }
 +            else if (op.Offset == 4)

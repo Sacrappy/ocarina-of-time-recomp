@@ -163,3 +163,11 @@ B4 or a direct job file), then a mesh pipeline (D2) with the paired fragment sha
   clamped), the task payload type of a task+mesh pair, or a descriptor bound for the wrong stage. The level's captured
   task pipelines are stages 1 6 7 (fragment, task, mesh); the ordinary (non-mesh) draws still render the frame black
   in these runs, so an `OOT_MESH=0` A/B is the next measurement.
+- 2026-11-08 (evening): the bisect rules out the two cheapest explanations. `OOT_MESH_TASK=0` (drop the task stage)
+  still loses the device on every run, and `OOT_MESH_ZERO=1` (the task/mesh stages read zeroed uniform/storage
+  descriptors) does too, so it is neither the task shader nor a descriptor bound for the wrong stage: the mesh stage's
+  own execution loses the GPU. The draws are tiny (3 workgroups), so it is a fault, not a timeout. A mesh shader's
+  per-vertex block now holds Position only (no unwritten PointSize/ClipDistance/CullDistance members). Next: the D4
+  probe, a hand-made minimal mesh pipeline drawn into an offscreen target, to iterate without the level; then bisect
+  the epilogue (vertices only vs primitives only).
+

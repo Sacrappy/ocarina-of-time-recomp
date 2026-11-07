@@ -2198,6 +2198,11 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         if (n_sets == 2 && i == lo[1]) d0[1] = nd;
         VkDescSlot *o = &d[nd];
         int st = nvn_stage_of(b->stage), kind = 0;   // kind: 0 buffer, 1 image, 2 texel buffer view
+        // OOT_MESH_ZERO=1 (diagnostic): the task/mesh stage reads zeroed descriptors, to tell a bad binding (pointer
+        // table, wrong stage) from the mesh output semantics when the device is lost.
+        static int mesh_zero = -1;
+        if (mesh_zero < 0) mesh_zero = cfg_get("OOT_MESH_ZERO") && *cfg_get("OOT_MESH_ZERO") == '1';
+        int zstage = mesh_zero && (st == NVN_STAGE_MS || st == NVN_STAGE_TS);
         if (b->kind == VK_PIPE_SUPPORT) {
             float in[3];
             support_in(ex, in);
@@ -2215,9 +2220,11 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
             }
             o->buffer = (VkDescriptorBufferInfo){B.sup_buf, B.sup_off, SUPPORT_BYTES};
         } else if (b->kind == GFX_RES_UBO) {
-            for (uint32_t k = 0; k < cnt; k++) o[k].buffer = ubo_info(ex, st, r->slot + (int)k);
+            for (uint32_t k = 0; k < cnt; k++)
+                o[k].buffer = zstage ? zero_info(0x1000) : ubo_info(ex, st, r->slot + (int)k);
         } else if (b->kind == GFX_RES_SSBO) {
-            for (uint32_t k = 0; k < cnt; k++) o[k].buffer = ssbo_info(ex, st, r, r->flags & 1);
+            for (uint32_t k = 0; k < cnt; k++)
+                o[k].buffer = zstage ? zero_info(0x10000) : ssbo_info(ex, st, r, r->flags & 1);
         } else if (b->kind == GFX_RES_TEX || b->kind == GFX_RES_IMG) {
             int img = b->kind == GFX_RES_IMG;
             if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || b->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
@@ -3158,10 +3165,15 @@ static int prepare_mesh(VkExec *ex) {
         return 0;
     }
 
+    // OOT_MESH_TASK=0 (diagnostic): drop the task stage of a task pipeline, to tell a task shader's fault from the
+    // mesh stage's. The mesh shader then reads a payload nothing wrote.
+    static int want_task = -1;
+    if (want_task < 0) want_task = !(cfg_get("OOT_MESH_TASK") && *cfg_get("OOT_MESH_TASK") == '0');
+
     uint32_t fbl = fs ? feedback_prepare(ex, fs) : 0;
     VkPipeState s = ex->pipe;
     s.vs = NULL;
-    s.ts = has_ts ? ts : NULL;
+    s.ts = has_ts && want_task ? ts : NULL;
     s.mesh = ms;
     s.fs = fs;
     s.feedback = (uint8_t)((fbl & 0xff ? 1 : 0) | (fbl & 0x100 ? 2 : 0));
