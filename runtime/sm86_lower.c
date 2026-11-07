@@ -55,7 +55,10 @@ int sm86_control_parse(const uint8_t *control, uint32_t control_size, Sm86Contro
     // Task and mesh (docs/mesh.md, A4): +0x58 low 16 bits the threads per workgroup, its top byte the payload in KiB;
     // +0x60 the maximum vertices (low 16) and primitives (high 16).
     c->mesh_threads = control[0x58] | (uint32_t)control[0x59] << 8;
-    c->payload = (uint32_t)control[0x5f] * 1024;
+    // The task payload (docs/mesh.md A4): 1 KiB per unit, 4 and 12 in the captured task pipelines and the same in
+    // their mesh stage; the 3 the stand-alone mesh programs carry is something else (they never read the payload).
+    uint32_t payload_kb = control[0x5f];
+    c->payload = (payload_kb == 4 || payload_kb == 12) ? payload_kb * 1024 : 0;
     memcpy(&c->max_vertices, control + 0x60, 4);
     c->max_primitives = c->max_vertices >> 16, c->max_vertices &= 0xffff;
     if (c->size < SM86_CONTROL_MIN || c->size > control_size) c->size = SM86_CONTROL_MIN;
