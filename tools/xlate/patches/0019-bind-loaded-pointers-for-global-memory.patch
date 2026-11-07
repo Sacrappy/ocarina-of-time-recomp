@@ -69,7 +69,7 @@
              {
                  return null;
              }
-@@ -584,6 +623,204 @@
+@@ -584,6 +623,256 @@
              return true;
          }
  
@@ -77,56 +77,13 @@
 +        // keeps the records of its objects in tables of pointers, and a near-leaf pass reads a
 +        // placement record from c0[12] or from *c0[12]. The table is a storage buffer the host binds
 +        // by its registered address; the record buffer is at the pointer read from it, which the
-+        // host resolves at draw time (the res.json "indirect" field). The shader then addresses the
++        // host resolves at draw time (the .res.json "indirect" field). The shader then addresses the
 +        // record by the address minus that pointer.
 +        private static bool IsStorageBufferLoad(Operand op)
 +        {
 +            return op.AsgOp is Operation operation &&
 +                   operation.Inst == Instruction.Load &&
 +                   operation.StorageKind == StorageKind.StorageBuffer;
-+        }
-+
-+        // The pointer an address expression adds to everything else; false when it has none, or more
-+        // than one (the two cannot be told apart at run time).
-+        private static bool TryFindLoadedPointer(Operand op, BasicBlock block, ref Operand found, int depth)
-+        {
-+            if (op == null || depth > 6)
-+            {
-+                return true;
-+            }
-+
-+            Operand o = Utils.FindLastOperation(op, block);
-+
-+            if (o == null)
-+            {
-+                return true;
-+            }
-+
-+            if (IsStorageBufferLoad(o))
-+            {
-+                if (found != null)
-+                {
-+                    return false;
-+                }
-+
-+                found = o;
-+                return true;
-+            }
-+
-+            if (o.AsgOp is Operation operation &&
-+                operation.Inst is Instruction.Add or Instruction.Subtract or Instruction.Multiply or
-+                                Instruction.ShiftLeft or Instruction.ShiftRightU32 or Instruction.BitwiseAnd)
-+            {
-+                for (int i = 0; i < operation.SourcesCount; i++)
-+                {
-+                    if (!TryFindLoadedPointer(operation.GetSource(i), block, ref found, depth + 1))
-+                    {
-+                        return false;
-+                    }
-+                }
-+            }
-+
-+            return true;
 +        }
 +
 +        // The constant buffer word whose value is the address of the buffer the load reads the
@@ -192,7 +149,107 @@
 +            return true;
 +        }
 +
-+        // The storage-buffer load an address goes through, and the table entry it reads.
++        // The table entry a pointer operand comes from: a load from the table, or a phi whose every
++        // source is a load from the same entry (the game picks the record type at run time).
++        private static bool TryGetTableEntry(Operand op, BasicBlock block, out int cbSlot, out int cbOffset, out int inner)
++        {
++            cbSlot = 0;
++            cbOffset = 0;
++            inner = 0;
++
++            if (op == null)
++            {
++                return false;
++            }
++
++            Operand o = Utils.FindLastOperation(op, block);
++
++            if (o == null)
++            {
++                return false;
++            }
++
++            if (IsStorageBufferLoad(o))
++            {
++                if (o.AsgOp is not Operation load || load.SourcesCount < 3)
++                {
++                    return false;
++                }
++
++                return TryGetHolderOffset(load.GetSource(2), out cbSlot, out cbOffset, out inner);
++            }
++
++            if (o.AsgOp is PhiNode phi && phi.SourcesCount > 0)
++            {
++                for (int i = 0; i < phi.SourcesCount; i++)
++                {
++                    if (!TryGetTableEntry(phi.GetSource(i), block, out int slot, out int offset, out int byteOffset))
++                    {
++                        return false;
++                    }
++
++                    if (i == 0)
++                    {
++                        cbSlot = slot;
++                        cbOffset = offset;
++                        inner = byteOffset;
++                    }
++                    else if (slot != cbSlot || offset != cbOffset || byteOffset != inner)
++                    {
++                        return false;
++                    }
++                }
++
++                return true;
++            }
++
++            return false;
++        }
++
++        // The pointer an address expression adds to everything else; false when it has none, or more
++        // than one (two tables cannot be told apart at run time here).
++        private static bool TryFindLoadedPointer(Operand op, BasicBlock block, ref Operand found, int depth)
++        {
++            if (op == null || depth > 6)
++            {
++                return true;
++            }
++
++            Operand o = Utils.FindLastOperation(op, block);
++
++            if (o == null)
++            {
++                return true;
++            }
++
++            if (TryGetTableEntry(o, block, out _, out _, out _))
++            {
++                if (found != null)
++                {
++                    return false;
++                }
++
++                found = o;
++                return true;
++            }
++
++            if (o.AsgOp is Operation operation &&
++                operation.Inst is Instruction.Add or Instruction.Subtract or Instruction.Multiply or
++                                Instruction.ShiftLeft or Instruction.ShiftRightU32 or Instruction.BitwiseAnd)
++            {
++                for (int i = 0; i < operation.SourcesCount; i++)
++                {
++                    if (!TryFindLoadedPointer(operation.GetSource(i), block, ref found, depth + 1))
++                    {
++                        return false;
++                    }
++                }
++            }
++
++            return true;
++        }
++
++        // The pointer an address goes through and the table entry it reads.
 +        private static bool TryGetLoadedPointerAccess(Operand address, BasicBlock block, out Operand pointer,
 +            out int cbSlot, out int cbOffset, out int inner)
 +        {
@@ -206,12 +263,7 @@
 +                return false;
 +            }
 +
-+            if (pointer.AsgOp is not Operation load || load.SourcesCount < 3)
-+            {
-+                return false;
-+            }
-+
-+            return TryGetHolderOffset(load.GetSource(2), out cbSlot, out cbOffset, out inner);
++            return TryGetTableEntry(pointer, block, out cbSlot, out cbOffset, out inner);
 +        }
 +
 +        // The shape of an address chain, for the failure notes in the .res.json.
@@ -274,7 +326,7 @@
          private static bool TryGenerateMultiTargetStorageOp(
              GtsContext gtsContext,
              ResourceManager resourceManager,
-@@ -657,7 +894,7 @@
+@@ -657,7 +946,7 @@
  
              if (targetCbs.Count == 0)
              {
@@ -283,7 +335,7 @@
              }
  
              if (gtsContext.TryGetFunctionId(operation, isMultiTarget: true, targetCbs, out functionId))
-@@ -830,7 +1067,8 @@
+@@ -830,7 +1119,8 @@
              resultValue = null;
              bool isStore = inst.IsAtomic() || inst == Instruction.Store;
  
