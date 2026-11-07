@@ -210,3 +210,23 @@ resolves the pointer when it binds the buffer. 23 level programs use it and thei
 A new white-frame trigger in the frame dump (`OOT_DUMP_WHEN=white:`) caught the flash and shows it is overexposure:
 the 1080p-to-1440p upscaler writes 5568 against 2.18 in a clean frame, from an exposure/scale that swings by 10^6
 between frames while the kernels and buffers stay the same. Details in `docs/phase3.md`.
+
+## 2026-11-08: task and mesh shaders, and shaders translated ahead of time
+
+The reference's mesh work (merged as `f0f3fb7`) showed that the Kokiri Forest draws much of its colour pass with mesh
+shaders, which were stubs here. The translator now has task and mesh stages (patch
+`0021-mesh-and-task-shaders.patch`): they decode like compute programs and expand the lowering's ISBE pseudo
+instruction into an emulated stage buffer in shared memory, and the epilogue marker into `OpSetMeshOutputsEXT` plus
+the copy of positions, attributes and primitive indices, or `OpEmitMeshTasksEXT` for a task stage. Mesh modules are
+SPIR-V 1.4 (`SPV_EXT_mesh_shader` requires it), which also means `StorageBuffer` instead of `Uniform`/`BufferBlock`
+and every global in the entry point's interface. The host gained `GFX_STAGE_TS`/`MS`, monolithic task+mesh+fragment
+pipelines, and `DrawMeshTasks`/`DrawMeshTasksIndirect` replayed through the recorder as
+`vkCmdDrawMeshTasksEXT`/`...IndirectEXT`. Offline, 11 of the 12 captured mesh programs lower, translate and pass
+`spirv-val`, and a synthetic task program validates. In game the mesh draws replay (the log names them) but the device
+is lost within about half a second; `OOT_MESH=0` keeps them as stubs, and an A/B shows the black frames at world
+28-31 s are the game's fade-in (the non-mesh run is black too), not the mesh path. `KEY_VERSION` is 18.
+
+In parallel, `tools/prepare_all_shaders.py` translates every shader variant ahead of time into the runtime's own cache
+layout, so `oot.exe` can load the modules from disk and never start a translator. Checked against the runtime's cache
+(1,018 of 1,018 recorded input ids reproduced from its 236 use masks) and the recorded variant set (1,011 variants
+cached and validated); `docs/shader-aot.md` has the formats, commands and limits.

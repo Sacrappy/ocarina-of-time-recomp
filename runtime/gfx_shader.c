@@ -56,7 +56,7 @@
 #define CONTROL_BOUND 0x400                                // bytes readable behind a control pointer (the records)
 #define BUCKETS 4096
 #define LINE_MAX_LEN 4096
-#define KEY_VERSION 17                                      // in every cache key; bump when the key layout or the use of the
+#define KEY_VERSION 18                                      // in every cache key; bump when the key layout or the use of the
                                                            // output changes here (4: translator identity, input ids;
                                                            // 5: NVN2 programs); translator changes are covered by its identity
 #define IN_VERSION 2                                       // in every input id and .in file: bump when the answers layout

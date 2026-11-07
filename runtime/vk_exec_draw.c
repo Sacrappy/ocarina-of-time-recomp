@@ -3210,8 +3210,9 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d) {
     {
         static volatile LONG shown;
         if (InterlockedIncrement(&shown) <= 3)
-            rt_log("vk_exec: mesh draw %s (program %llu, stages %#x) replayed", d->ind ? "indirect" : "direct",
-                   (unsigned long long)ex->prog->serial, (unsigned)ex->prog_stages);
+            rt_log("vk_exec: mesh draw %s (%u groups from %u, program %llu, stages %#x) replayed",
+                   d->ind ? "indirect" : "direct", d->count, d->first, (unsigned long long)ex->prog->serial,
+                   (unsigned)ex->prog_stages);
     }
     if (d->ind) {
         VkMemSpan ip;
