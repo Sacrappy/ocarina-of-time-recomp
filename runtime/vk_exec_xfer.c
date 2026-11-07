@@ -146,6 +146,13 @@ static uint64_t oq_resets, oq_drawn, oq_lost_draws;   // replay thread: counters
 
 typedef struct { uint64_t addr; int reset, lost; uint32_t n; uint32_t q[]; } OqSegment;
 
+// One batch of segments per submission, one completion callback for the whole batch. The title resets and reports the
+// counter about 45 times a frame (once per culled object); a malloc and a queued callback per report cost the
+// completion thread more than reading the queries does.
+typedef struct { int n, cap; OqSegment **v; } OqBatch;
+static OqBatch *oq_batch;   // replay thread: the batch of the submission being recorded
+static uint64_t oq_batch_fence;
+
 static int oq_ready(void) {
     if (oq_state) return oq_state > 0;
     VkCtx *v = vk_ctx();
@@ -217,11 +224,11 @@ void vk_exec_xfer_shutdown(void) {
     oq_pool = VK_NULL_HANDLE, oq_state = 0, oq_next = 0, oq_counting = oq_reported = oq_keep = 0, oq_open = -1;
     oq_nseg = 0, oq_lost = 0, oq_count = 0;
     oq_reports_done = oq_last = oq_resets = oq_drawn = oq_lost_draws = 0;
+    oq_batch = NULL, oq_batch_fence = 0;
     memset((void *)oq_busy, 0, sizeof oq_busy);
 }
 
-static void oq_cb(void *arg) {
-    OqSegment *s = arg;
+static void oq_cb_one(OqSegment *s) {
     VkDevice dev = vk_ctx()->device;
     uint64_t sum = 0, v[64 * 2];
     for (uint32_t i = 0; i < s->n;) {
@@ -254,10 +261,21 @@ static void oq_cb(void *arg) {
         oq_reports_done++;
         oq_last = oq_count;
     }
-    free(s);
 }
 
-// Hands the segment to the completion thread with a report (addr; 0: no CPU-visible memory) or a reset.
+static void oq_cb(void *arg) {
+    OqBatch *b = arg;
+    for (int i = 0; i < b->n; i++) {
+        oq_cb_one(b->v[i]);
+        free(b->v[i]);
+    }
+    free(b->v);
+    free(b);
+}
+
+// Hands the segment to the completion thread with a report (addr; 0: no CPU-visible memory) or a reset. The first
+// segment of a submission starts its batch and queues the one callback; later ones append to it (recording for a
+// submission is sequential, so the batch is complete before it is submitted).
 static void oq_segment(VkExec *ex, uint64_t addr, int reset) {
     oq_close(ex);
     OqSegment *s = malloc(sizeof *s + sizeof *s->q * oq_nseg);
@@ -265,7 +283,19 @@ static void oq_segment(VkExec *ex, uint64_t addr, int reset) {
     s->addr = addr, s->reset = reset, s->lost = oq_lost, s->n = oq_nseg;
     memcpy(s->q, oq_seg, sizeof *s->q * oq_nseg);
     oq_nseg = 0, oq_lost = 0;
-    vk_completion_add(ex->fence, oq_cb, s);
+    if (!oq_batch || oq_batch_fence != ex->fence) {
+        oq_batch = calloc(1, sizeof *oq_batch);
+        if (!oq_batch) rt_fatal("vk: out of memory");
+        oq_batch_fence = ex->fence;
+        vk_completion_add(ex->fence, oq_cb, oq_batch);
+    }
+    if (oq_batch->n == oq_batch->cap) {
+        int cap = oq_batch->cap ? oq_batch->cap * 2 : 16;
+        OqSegment **v = realloc(oq_batch->v, sizeof *v * (size_t)cap);
+        if (!v) rt_fatal("vk: out of memory");
+        oq_batch->v = v, oq_batch->cap = cap;
+    }
+    oq_batch->v[oq_batch->n++] = s;
 }
 
 static void reset_counter(VkExec *ex, const p_reset_counter *p) {

@@ -93,6 +93,7 @@ struct RtThread {
     uint64_t wobj;             // what the current wait is on: owner handle, key, address or first handle
     uint32_t waker;            // the thread whose signal ended the last wait (0: a host thread or a timeout)
     uint64_t wake_at, grant_at;   // when a wait was signalled and a core granted, until the thread runs again
+    uint64_t blk_at;              // when the current block began (OOT_WAKE_LOG)
     uint64_t lw_ns, lw_n, lw_max, lg_ns, lg_n, lg_max, sl_n, sl_req, sl_act;   // those latencies; SleepThread asked/took
     uint64_t sp_n, sp_ho, sp_site;   // spin wait passes and core handoffs, the last loop head (the thread writes them)
     RtThread *target;          // as a core waiter: the owner core_kick asked to give its core up for it (holding G)
@@ -234,7 +235,28 @@ static RtThread *pick(int kind, uint64_t a) {
     return b;
 }
 
+// OOT_WAKE_LOG=1 (diagnostic): every wake of a guest thread that waited longer than 100 ms, with the guest pc of both
+// the waiter and the signaller. The intro cinematic's ~160 ms stalls are waits somewhere in the guest; this names both
+// ends without a debugger.
+static int wake_log_on = -1;
+static void wake_log(RtThread *t) {
+    if (wake_log_on < 0) wake_log_on = cfg_get("OOT_WAKE_LOG") != NULL;
+    if (!wake_log_on || !t->blk_at) return;
+    uint64_t waited = kern_now_ns() - t->blk_at;
+    if (waited < 100000000ull) return;
+    static volatile LONG said;
+    if (InterlockedIncrement(&said) > 2000) return;
+    char w[128] = "-", s[128] = "-";
+    if (t->cur && t->cur->pc) ldr_describe(t->cur->pc, w, sizeof w);
+    if (tcur && tcur->cur && tcur->cur->pc) ldr_describe(tcur->cur->pc, s, sizeof s);
+    rt_log("kern: %#x waited %.1f ms on %s %#llx, signalled by %#x at %s", t->handle, waited / 1e6,
+           t->wkind == W_ADDRESS ? "address" : t->wkind == W_CONDVAR ? "condvar" : t->wkind == W_SYNC ? "sync" : "lock",
+           (unsigned long long)(t->wkind == W_SYNC ? t->wobj : t->waddr), tcur ? tcur->handle : 0, s);
+    rt_log("kern:   waiter was at %s", w);
+}
+
 static void wake(RtThread *t, uint32_t res) {
+    wake_log(t);
     wait_unlink(t);
     t->wkind = W_NONE;
     t->woke = 1;
@@ -256,6 +278,7 @@ static void wake_sync_waiters(void) {
 // SleepConditionVariableSRW counts milliseconds: round up (late is legal, early is not) and re-check the deadline
 // against the performance counter, because the wait may also end early.
 static uint32_t block_inner(RtThread *t, int kind, int64_t ns) {
+    t->blk_at = kern_now_ns();
     t->wkind = kind;
     t->woke = 0;
     t->wseq = ++g_wseq;
