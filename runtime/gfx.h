@@ -95,6 +95,7 @@ typedef struct {
     uint16_t count;             // descriptors (array length)
     uint8_t separate;           // TEX: texture and sampler handles are separate
     uint8_t bindless;           // TEX/IMG: a pool-indexed array (Ryujinx BindlessElimination: handle 0x40000000, cbuf 0)
+    uint32_t indirect;          // SSBO: the base is the pointer at this byte offset of the buffer at cbuf_slot/cbuf_offset
     uint8_t pool;               // TEX: GFX_POOL_* binding + 1 of that array in the pool set; 0: not one, or unsupported
 } GfxShaderRes;
 // Pool-indexed (bindless) sampling. The translator turns a sample through a handle loaded from a constant buffer into an

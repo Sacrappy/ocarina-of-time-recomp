@@ -476,3 +476,33 @@ correct. Four threads of work got here.
 - Open: the fog kernel's NaN, the overexposed materials (and whether they share one cause), the level's GPU cost
   (hundreds of unique programs, 3000+ draws), and the remaining lowering programs. The start-up `0xc0000005` and the
   occasional `vk: upload submit failed (-4)` (VRAM at 11.0 of 11.9 GB) still take retries.
+
+## Status (2026-11-07, night): pointer-table storage buffers; the white flash is exposure
+
+Two different faults sit behind the white the player sees, and the frame dump now separates them.
+
+- Pointer tables. OoT's graphics shaders read their per-object records through tables of 64-bit pointers kept in
+  storage buffers: the address is `Load(StorageBuffer) + k`, and Ryujinx's global-memory pass only knew constant
+  buffer words as bases, so every such access became a read of 0. Translator patches 0019 and 0020 add them: the
+  pass walks the address for a storage-buffer load, takes the table's constant-buffer word and the byte offset of
+  the pointer in it, and emits the access as `global address - pointer`; `ResourceManager`/`BufferDescriptor` give
+  it its own binding, `Program.cs` writes it as the reflection's `indirect` field, and `vk_exec_draw.c ssbo_info`
+  reads the pointer from guest memory at bind time. On the level 23 programs now bind their record buffers this
+  way (the pointers sit at +8..+32 of the table), and the accesses that used to read zero drop from 253 to 184 per
+  program. The white characters and foliage did not change visibly, so their shade comes from elsewhere (the
+  overexposure below, or the 40 programs whose addresses are still unresolved: 27 compute, 5 vertex, 8 pixel, with
+  shapes such as `Add(Add(Multiply(...), Load:StorageBuffer), Const)` and `Copy:GlobalMemory(Call(...))`).
+- The white flash is overexposure, not NaN. `OOT_DUMP_WHEN=white:<count>[@<present>]` (`runtime/boot.c`) reads
+  each presented frame back, counts pure-white pixels (a quarter of the screen in a flash) and arms the frame dump
+  there; it needs no shot ring, so the run keeps 25-40 fps. The dump of a flash (`build/logs/dump-white3`, present
+  1102, 316 passes): every target is finite. The 1080p-to-1440p kernel `b1100763...` writes 5568 where a clean frame
+  writes 2.18, and its input, the packed-frame kernel `fb22b80b...`, writes 50 in the flash frame and 65024 in the
+  clean one. Same kernels, same buffers, a 3x10^6 swing of the scale between the two: the exposure/scale value the
+  pair uses is what changes, not the geometry or the fog. The fog volumes are clean in this build (the skipped
+  kernels' images are zeroed by `skip_zero_images`), so the old NaN chain no longer explains it.
+- Next: find that scale. It is not in any storage image the dump copies; the two kernels read it from a uniform
+  block (no `cs ssbo` line for them). Its writer is probably the luminance/adaptation chain (`pass 231..240`), and
+  the game may read the value back to the CPU between frames, which is the same class as the emulator's "macro DMA
+  read of a report region served stale counts" fix (Lichii-1 `7ae3e74014`): confirm by dumping the same pass in a
+  flash frame and a clean frame with the constant banks printed, then check whether a skipped kernel
+  (`1a62084a`, `ace1cec0`) is the writer.

@@ -1,0 +1,143 @@
+--- a/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
+@@ -26,6 +26,10 @@
+ 
+         private readonly Dictionary<int, int> _sbSlots;
+         private readonly Dictionary<int, int> _sbSlotsReverse;
++        // Pointer-table storage buffers: keyed by (cbuf slot, cbuf offset, byte offset of the pointer).
++        private readonly Dictionary<long, int> _sbIndirectSlots;
++        private readonly Dictionary<int, long> _sbIndirectReverse;
++        private int _sbSlotNext;
+ 
+         private readonly HashSet<int> _usedConstantBufferBindings;
+ 
+@@ -66,12 +70,15 @@
+             _stagePrefix = GetShaderStagePrefix(stage);
+ 
+             _cbSlotToBindingMap = new SetBindingPair[18];
+-            _sbSlotToBindingMap = new SetBindingPair[16];
++            // 16 storage buffers per NVN stage, plus the pointer tables a global access can go through.
++            _sbSlotToBindingMap = new SetBindingPair[32];
+             _cbSlotToBindingMap.AsSpan().Fill(new(-1, -1));
+             _sbSlotToBindingMap.AsSpan().Fill(new(-1, -1));
+ 
+             _sbSlots = new();
+             _sbSlotsReverse = new();
++            _sbIndirectSlots = new();
++            _sbIndirectReverse = new();
+ 
+             _usedConstantBufferBindings = new();
+ 
+@@ -161,7 +168,16 @@
+ 
+         public bool TryGetStorageBufferBinding(int sbCbSlot, int sbCbOffset, bool write, out int binding)
+         {
+-            if (!TryGetSbSlot((byte)sbCbSlot, (ushort)sbCbOffset, out int slot))
++            return TryGetStorageBufferBinding(sbCbSlot, sbCbOffset, false, 0, write, out binding);
++        }
++
++        public bool TryGetStorageBufferBinding(int sbCbSlot, int sbCbOffset, bool indirect, uint indirectOffset, bool write, out int binding)
++        {
++            bool found = indirect
++                ? TryGetSbIndirectSlot((byte)sbCbSlot, (ushort)sbCbOffset, indirectOffset, out int slot)
++                : TryGetSbSlot((byte)sbCbSlot, (ushort)sbCbOffset, out slot);
++
++            if (!found)
+             {
+                 binding = 0;
+                 return false;
+@@ -192,7 +208,7 @@
+ 
+             if (!_sbSlots.TryGetValue(key, out slot))
+             {
+-                slot = _sbSlots.Count;
++                slot = _sbSlotNext++;
+ 
+                 if (slot >= _sbSlotToBindingMap.Length)
+                 {
+@@ -201,6 +217,26 @@
+ 
+                 _sbSlots.Add(key, slot);
+                 _sbSlotsReverse.Add(slot, key);
++            }
++
++            return true;
++        }
++
++        private bool TryGetSbIndirectSlot(byte sbCbSlot, ushort sbCbOffset, uint indirectOffset, out int slot)
++        {
++            long key = ((long)sbCbSlot << 48) | ((long)sbCbOffset << 32) | indirectOffset;
++
++            if (!_sbIndirectSlots.TryGetValue(key, out slot))
++            {
++                slot = _sbSlotNext++;
++
++                if (slot >= _sbSlotToBindingMap.Length)
++                {
++                    return false;
++                }
++
++                _sbIndirectSlots.Add(key, slot);
++                _sbIndirectReverse.Add(slot, key);
+             }
+ 
+             return true;
+@@ -478,7 +514,7 @@
+ 
+         public BufferDescriptor[] GetStorageBufferDescriptors()
+         {
+-            BufferDescriptor[] descriptors = new BufferDescriptor[_sbSlots.Count];
++            BufferDescriptor[] descriptors = new BufferDescriptor[_sbSlots.Count + _sbIndirectSlots.Count];
+ 
+             int descriptorIndex = 0;
+ 
+@@ -491,6 +527,20 @@
+                     (int sbCbSlot, int sbCbOffset) = UnpackSbCbInfo(key);
+                     BufferUsageFlags flags = (_sbSlotWritten & (1u << slot)) != 0 ? BufferUsageFlags.Write : BufferUsageFlags.None;
+                     descriptors[descriptorIndex++] = new BufferDescriptor(setAndBinding.SetIndex, setAndBinding.Binding, slot, sbCbSlot, sbCbOffset, flags);
++                }
++            }
++
++            foreach ((long key, int slot) in _sbIndirectSlots)
++            {
++                SetBindingPair setAndBinding = _sbSlotToBindingMap[slot];
++
++                if (setAndBinding.Binding >= 0)
++                {
++                    int sbCbSlot = (int)(key >> 48) & 0xff;
++                    int sbCbOffset = (int)(key >> 32) & 0xffff;
++                    uint indirectOffset = (uint)key;
++                    BufferUsageFlags flags = (_sbSlotWritten & (1u << slot)) != 0 ? BufferUsageFlags.Write : BufferUsageFlags.None;
++                    descriptors[descriptorIndex++] = new BufferDescriptor(setAndBinding.SetIndex, setAndBinding.Binding, slot, sbCbSlot, sbCbOffset, flags, indirectOffset);
+                 }
+             }
+ 
+--- a/src/Ryujinx.Graphics.Shader/BufferDescriptor.cs
++++ b/src/Ryujinx.Graphics.Shader/BufferDescriptor.cs
+@@ -10,6 +10,9 @@
+         public readonly byte SbCbSlot;
+         public readonly ushort SbCbOffset;
+         public readonly BufferUsageFlags Flags;
++        // Non-zero when the buffer's base address is the 64-bit pointer stored at this byte offset of the
++        // storage buffer registered at SbCbSlot/SbCbOffset (a pointer table; Ocarina of Time's records).
++        public readonly uint Indirect;
+ 
+         public BufferDescriptor(int set, int binding, int slot)
+         {
+@@ -30,5 +33,16 @@
+             SbCbOffset = (ushort)sbCbOffset;
+             Flags = flags;
+         }
++
++        public BufferDescriptor(int set, int binding, int slot, int sbCbSlot, int sbCbOffset, BufferUsageFlags flags, uint indirect)
++        {
++            Set = set;
++            Binding = binding;
++            Slot = (byte)slot;
++            SbCbSlot = (byte)sbCbSlot;
++            SbCbOffset = (ushort)sbCbOffset;
++            Flags = flags;
++            Indirect = indirect;
++        }
+     }
+ }

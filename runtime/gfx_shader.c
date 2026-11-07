@@ -717,6 +717,7 @@ static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
             r->cbuf_slot = (int8_t)json_int(o, e, "cb_slot", -1);
             r->handle = (uint16_t)json_int(o, e, "cb_offset", 0);
             r->flags = (uint8_t)json_int(o, e, "flags", 0);
+            r->indirect = (uint32_t)json_int(o, e, "indirect", 0);
         }
         return;
     }

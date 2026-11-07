@@ -201,3 +201,12 @@ SURED, LEA) lifted 156 of the 193 failing programs; the reference's bindless poo
 (`d84bf5d`) replaced the per-draw pool scan that cost about 100 ms a frame. The level draws (3D with
 `OOT_SKIP_CS=1a62084a`), the HUD and the minimap render, and the frame is now GPU-bound (2 fps at 2560x1440) with the
 fog NaN and overexposed materials open. Details in `docs/phase3.md`.
+
+## 2026-11-07, night: pointer tables and the white flash
+
+Translator patches 0019/0020 bind the storage-buffer pointer tables OoT's object records live behind (the
+emulator's "loaded pointer" case): the pass emits the access as an offset from the loaded pointer and the host
+resolves the pointer when it binds the buffer. 23 level programs use it and their zero reads drop from 253 to 184.
+A new white-frame trigger in the frame dump (`OOT_DUMP_WHEN=white:`) caught the flash and shows it is overexposure:
+the 1080p-to-1440p upscaler writes 5568 against 2.18 in a clean frame, from an exposure/scale that swings by 10^6
+between frames while the kernels and buffers stay the same. Details in `docs/phase3.md`.

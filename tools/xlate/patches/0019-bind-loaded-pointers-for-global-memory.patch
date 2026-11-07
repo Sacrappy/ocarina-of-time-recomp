@@ -1,0 +1,295 @@
+--- a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
+@@ -191,6 +191,12 @@
+             public Operand Offset { get; }
+             public int ConstOffset { get; }
+             public bool SubtractBase { get; }
++            // A pointer table: the buffer's base address is the 64-bit pointer stored at byte
++            // IndirectOffset of the storage buffer bound at Cbuf(SbCbSlot, SbCbOffset). Ocarina of
++            // Time reads its per-object records through such tables (the host reads the pointer when
++            // it binds the buffer, so the shader only needs the offset from that base).
++            public bool Indirect { get; }
++            public uint IndirectOffset { get; }
+ 
+             public SearchResult(int sbCbSlot, int sbCbOffset)
+             {
+@@ -205,6 +211,15 @@
+                 Offset = offset;
+                 ConstOffset = constOffset;
+                 SubtractBase = subtractBase;
++            }
++
++            public SearchResult(int sbCbSlot, int sbCbOffset, Operand offset, uint indirectOffset)
++            {
++                SbCbSlot = sbCbSlot;
++                SbCbOffset = sbCbOffset;
++                Offset = offset;
++                Indirect = true;
++                IndirectOffset = indirectOffset;
+             }
+         }
+ 
+@@ -310,6 +325,29 @@
+             Operand globalAddress = operation.GetSource(0);
+             SearchResult result = FindUniqueBaseAddressCb(gtsContext, block, globalAddress, needsOffset: true);
+ 
++            if (!result.Found &&
++                TryGetLoadedPointerAccess(operation.GetSource(0), block,
++                    out Operand pointer, out int holderSlot, out int holderOffset, out int holderInner))
++            {
++                // The record's offset from the pointer it was reached through; the host binds the buffer at
++                // the pointer, so nothing here depends on the pointer's value.
++                Operand indirectOffset = Local();
++                node.List.AddBefore(node, new Operation(Instruction.Subtract, indirectOffset, operation.GetSource(0), pointer));
++                SearchResult indirect = new(holderSlot, holderOffset, indirectOffset, (uint)holderInner);
++
++                if (CanUseInlineStorageOp(operation, targetLanguage))
++                {
++                    return GenerateInlineStorageOp(resourceManager, node, operation, indirectOffset, indirect);
++                }
++
++                if (!TryGenerateSingleTargetStorageOp(gtsContext, resourceManager, targetLanguage, operation, indirect, out int indirectFunctionId))
++                {
++                    return null;
++                }
++
++                return GenerateCallStorageOp(node, operation, indirectOffset, indirectFunctionId);
++            }
++
+             if (result.Found)
+             {
+                 // We found the storage buffer that is being accessed.
+@@ -411,7 +449,8 @@
+             SearchResult result)
+         {
+             bool isStore = operation.Inst == Instruction.Store || operation.Inst.IsAtomic();
+-            if (!resourceManager.TryGetStorageBufferBinding(result.SbCbSlot, result.SbCbOffset, isStore, out int binding))
++            if (!resourceManager.TryGetStorageBufferBinding(result.SbCbSlot, result.SbCbOffset, result.Indirect,
++                result.IndirectOffset, isStore, out int binding))
+             {
+                 return null;
+             }
+@@ -584,6 +623,204 @@
+             return true;
+         }
+ 
++        // A global address can go through a pointer loaded from a storage buffer: Ocarina of Time
++        // keeps the records of its objects in tables of pointers, and a near-leaf pass reads a
++        // placement record from c0[12] or from *c0[12]. The table is a storage buffer the host binds
++        // by its registered address; the record buffer is at the pointer read from it, which the
++        // host resolves at draw time (the res.json "indirect" field). The shader then addresses the
++        // record by the address minus that pointer.
++        private static bool IsStorageBufferLoad(Operand op)
++        {
++            return op.AsgOp is Operation operation &&
++                   operation.Inst == Instruction.Load &&
++                   operation.StorageKind == StorageKind.StorageBuffer;
++        }
++
++        // The pointer an address expression adds to everything else; false when it has none, or more
++        // than one (the two cannot be told apart at run time).
++        private static bool TryFindLoadedPointer(Operand op, BasicBlock block, ref Operand found, int depth)
++        {
++            if (op == null || depth > 6)
++            {
++                return true;
++            }
++
++            Operand o = Utils.FindLastOperation(op, block);
++
++            if (o == null)
++            {
++                return true;
++            }
++
++            if (IsStorageBufferLoad(o))
++            {
++                if (found != null)
++                {
++                    return false;
++                }
++
++                found = o;
++                return true;
++            }
++
++            if (o.AsgOp is Operation operation &&
++                operation.Inst is Instruction.Add or Instruction.Subtract or Instruction.Multiply or
++                                Instruction.ShiftLeft or Instruction.ShiftRightU32 or Instruction.BitwiseAnd)
++            {
++                for (int i = 0; i < operation.SourcesCount; i++)
++                {
++                    if (!TryFindLoadedPointer(operation.GetSource(i), block, ref found, depth + 1))
++                    {
++                        return false;
++                    }
++                }
++            }
++
++            return true;
++        }
++
++        // The constant buffer word whose value is the address of the buffer the load reads the
++        // pointer from, and the byte offset of the pointer in that buffer. The translator's storage
++        // offset is a word offset: ShiftRight(base + k - (base & -align), 2).
++        private static bool TryGetHolderOffset(Operand wordOffset, out int cbSlot, out int cbOffset, out int inner)
++        {
++            cbSlot = 0;
++            cbOffset = 0;
++            inner = 0;
++
++            Operand w = wordOffset;
++
++            if (w == null)
++            {
++                return false;
++            }
++
++            if (w.AsgOp is Operation shift && shift.Inst == Instruction.ShiftRightU32 &&
++                shift.GetSource(1).Type == OperandType.Constant && shift.GetSource(1).Value == 2)
++            {
++                w = shift.GetSource(0);
++            }
++
++            if (w.AsgOp is Operation sub && sub.Inst == Instruction.Subtract)
++            {
++                bool maskedSecond = sub.GetSource(1).AsgOp is Operation m1 && m1.Inst == Instruction.BitwiseAnd;
++                bool maskedFirst = sub.GetSource(0).AsgOp is Operation m0 && m0.Inst == Instruction.BitwiseAnd;
++
++                if (maskedSecond || maskedFirst)
++                {
++                    w = maskedSecond ? sub.GetSource(0) : sub.GetSource(1);
++                }
++            }
++
++            int k = 0;
++
++            if (w.AsgOp is Operation add && add.Inst == Instruction.Add)
++            {
++                Operand src1 = add.GetSource(0);
++                Operand src2 = add.GetSource(1);
++
++                if (src1.Type == OperandType.ConstantBuffer && src2.Type == OperandType.Constant)
++                {
++                    w = src1;
++                    k = (int)src2.Value;
++                }
++                else if (src2.Type == OperandType.ConstantBuffer && src1.Type == OperandType.Constant)
++                {
++                    w = src2;
++                    k = (int)src1.Value;
++                }
++            }
++
++            if (w.Type != OperandType.ConstantBuffer)
++            {
++                return false;
++            }
++
++            cbSlot = w.GetCbufSlot();
++            cbOffset = w.GetCbufOffset();
++            inner = k;
++            return true;
++        }
++
++        // The storage-buffer load an address goes through, and the table entry it reads.
++        private static bool TryGetLoadedPointerAccess(Operand address, BasicBlock block, out Operand pointer,
++            out int cbSlot, out int cbOffset, out int inner)
++        {
++            pointer = null;
++            cbSlot = 0;
++            cbOffset = 0;
++            inner = 0;
++
++            if (!TryFindLoadedPointer(address, block, ref pointer, 0) || pointer == null)
++            {
++                return false;
++            }
++
++            if (pointer.AsgOp is not Operation load || load.SourcesCount < 3)
++            {
++                return false;
++            }
++
++            return TryGetHolderOffset(load.GetSource(2), out cbSlot, out cbOffset, out inner);
++        }
++
++        // The shape of an address chain, for the failure notes in the .res.json.
++        private static string DescribeChain(Operand op, int depth)
++        {
++            if (op == null)
++            {
++                return "null";
++            }
++
++            if (depth > 4)
++            {
++                return "...";
++            }
++
++            if (op.Type == OperandType.ConstantBuffer)
++            {
++                return $"Cbuf({op.GetCbufSlot()},{op.GetCbufOffset()})";
++            }
++
++            if (op.Type == OperandType.Constant)
++            {
++                return $"Const({op.Value})";
++            }
++
++            if (op.AsgOp is Operation o)
++            {
++                System.Text.StringBuilder sb = new();
++                sb.Append(o.Inst.ToString());
++                if (o.StorageKind != StorageKind.None)
++                {
++                    sb.Append(':').Append(o.StorageKind.ToString());
++                }
++                sb.Append('(');
++                int n = Math.Min(o.SourcesCount, 3);
++                for (int i = 0; i < n; i++)
++                {
++                    if (i > 0)
++                    {
++                        sb.Append(", ");
++                    }
++                    sb.Append(DescribeChain(o.GetSource(i), depth + 1));
++                }
++                if (o.SourcesCount > n)
++                {
++                    sb.Append(", ...");
++                }
++                sb.Append(')');
++                return sb.ToString();
++            }
++
++            if (op.AsgOp is PhiNode p)
++            {
++                return $"Phi({p.SourcesCount})";
++            }
++
++            return op.Type.ToString();
++        }
++
+         private static bool TryGenerateMultiTargetStorageOp(
+             GtsContext gtsContext,
+             ResourceManager resourceManager,
+@@ -657,7 +894,7 @@
+ 
+             if (targetCbs.Count == 0)
+             {
+-                gpuAccessor.Log($"Failed to find storage buffer for global memory operation \"{operation.Inst}\".");
++                gpuAccessor.Log($"Failed to find storage buffer for global memory operation \"{operation.Inst}\": {DescribeChain(operation.GetSource(0), 0)}.");
+             }
+ 
+             if (gtsContext.TryGetFunctionId(operation, isMultiTarget: true, targetCbs, out functionId))
+@@ -830,7 +1067,8 @@
+             resultValue = null;
+             bool isStore = inst.IsAtomic() || inst == Instruction.Store;
+ 
+-            if (!resourceManager.TryGetStorageBufferBinding(result.SbCbSlot, result.SbCbOffset, isStore, out int binding))
++            if (!resourceManager.TryGetStorageBufferBinding(result.SbCbSlot, result.SbCbOffset, result.Indirect,
++                result.IndirectOffset, isStore, out int binding))
+             {
+                 return false;
+             }

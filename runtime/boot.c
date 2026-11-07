@@ -280,8 +280,10 @@ static struct { uint8_t *px; uint64_t frame; } *ring;
 static int ring_n, ring_next, ring_full;
 static SRWLOCK ring_lock = SRWLOCK_INIT;
 static void ring_shot(const tex_t *t, uint64_t n) {
-    static int parsed, on;
+    static int parsed, on, detect;
     static unsigned long long at;
+    static unsigned long long when_blue = ULLONG_MAX, when_from, when_white = ULLONG_MAX, when_white_from;
+    static int white_done;
     if (!parsed) {
         const char *e = cfg_get("OOT_SHOT_RING");
         ring_n = e && *e ? atoi(e) : 0;
@@ -295,9 +297,19 @@ static void ring_shot(const tex_t *t, uint64_t n) {
             at = a && *a ? strtoull(a, NULL, 10) : 0;
             rt_log("boot: shot ring of %d presents at %dx%d; P writes it%s", ring_n, RING_W, RING_H, at ? " (and present OOT_SHOT_RING_AT)" : "");
         }
+        // OOT_DUMP_WHEN=blue:<count>[@<present>] or white:<count>[@<present>]; white alone needs no ring: it counts
+        // the full presented frame, so a glitch that flips a few frames can arm the dump with a plain readback.
+        const char *e2 = cfg_get("OOT_DUMP_WHEN");
+        char *q = NULL;
+        when_blue = e2 && !strncmp(e2, "blue:", 5) ? strtoull(e2 + 5, &q, 10) : 0;
+        when_from = q && *q == '@' ? strtoull(q + 1, NULL, 10) : 0;
+        q = NULL;
+        when_white = e2 && !strncmp(e2, "white:", 6) ? strtoull(e2 + 6, &q, 10) : 0;
+        when_white_from = q && *q == '@' ? strtoull(q + 1, NULL, 10) : 0;
+        detect = (when_white != 0) || (when_blue != 0 && on);
         parsed = 1;
     }
-    if (!on) return;
+    if (!on && !detect) return;
     int fmt = t->d.format;
     int bgra = fmt == NVN_FORMAT_BGRA8 || fmt == NVN_FORMAT_BGRA8_SRGB;
     if (!bgra && fmt != NVN_FORMAT_RGBA8 && fmt != NVN_FORMAT_RGBA8_SRGB) return;
@@ -312,30 +324,35 @@ static void ring_shot(const tex_t *t, uint64_t n) {
     if (gfx_replay_async()) gfx_backend()->finish();
     gfx_backend()->read_texels(t, &view, &r, px, 4ull * w, 4ull * w * h);
     flip_rows(px, w, h);
-    AcquireSRWLockExclusive(&ring_lock);
-    box_filter(px, w, h, bgra, ring[ring_next].px, RING_W, RING_H);
-    ring[ring_next].frame = n;
-    static unsigned long long when_blue = ULLONG_MAX, when_from;
-    if (when_blue == ULLONG_MAX) {
-        const char *e = cfg_get("OOT_DUMP_WHEN");
-        char *q = NULL;
-        when_blue = e && !strncmp(e, "blue:", 5) ? strtoull(e + 5, &q, 10) : 0;
-        when_from = q && *q == '@' ? strtoull(q + 1, NULL, 10) : 0;
-    }
-    if (when_blue && n >= when_from) {
-        const uint8_t *o = ring[ring_next].px;
-        unsigned long long blue = 0;
-        for (uint64_t i = 0; i < 4ull * RING_W * RING_H; i += 4)
-            blue += o[i + 2] > 200 && o[i] < 80 && o[i + 1] < 120;
-        if (blue >= when_blue) {
+    // Counted on the full frame: the ring's 800x450 box filter is what made a per-present check cost 40 ms.
+    unsigned long long white = 0, blue = 0;
+    if (detect)
+        for (uint64_t i = 0; i < 4ull * w * h; i += 4) {
+            if (px[i] > 240 && px[i + 1] > 240 && px[i + 2] > 240) white++;
+            if (px[i + 2] > 200 && px[i] < 80 && px[i + 1] < 120) blue++;
+        }
+    if (on) {
+        AcquireSRWLockExclusive(&ring_lock);
+        box_filter(px, w, h, bgra, ring[ring_next].px, RING_W, RING_H);
+        ring[ring_next].frame = n;
+        if (when_blue && n >= when_from &&
+            (double)blue * (RING_W * (double)RING_H) >= (double)when_blue * ((double)w * h)) {
             rt_log("boot: present %llu has %llu pure-blue pixels: arming the dump", (unsigned long long)n, blue);
             vk_dump_arm(n + 2);
         }
+        if (++ring_next == ring_n) ring_next = 0, ring_full = 1;
+        ReleaseSRWLockExclusive(&ring_lock);
     }
-    if (++ring_next == ring_n) ring_next = 0, ring_full = 1;
-    ReleaseSRWLockExclusive(&ring_lock);
+    // The flash-to-white glitch leaves most of the 3D scene white for a few frames; arm the dump where it happens.
+    if (when_white && !white_done && n >= when_white_from && white >= when_white) {
+        white_done = 1;
+        rt_log("boot: present %llu has %llu pure-white pixels: arming the dump", (unsigned long long)n, white);
+        vk_dump_arm(n + 2);
+        if (on) rt_shot_ring_dump();
+    }
     if (at && n == at) rt_shot_ring_dump();
 }
+
 typedef struct { int n; struct { uint8_t *px; uint64_t frame; } *f; char dir[MAX_PATH]; } RingDump;
 static DWORD WINAPI ring_write_main(void *arg) {
     RingDump *d = arg;

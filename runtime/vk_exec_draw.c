@@ -1126,6 +1126,22 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
         int kind, s2 = nvn2_c0_slot(ex, (uint32_t)r->handle * 4, &kind);
         if (s2 >= 0 && kind == 0 && s2 < 16) b = &ex->ssbo[st][s2];
     }
+    if (b && r->indirect) {
+        // A pointer table: the base is the 64-bit pointer the bound buffer holds at this byte offset (OoT's
+        // per-object record tables). The translator turned the access into an offset from that pointer, so the
+        // target is bound at the pointer itself; a pointer outside every pool keeps the zero buffer.
+        uint64_t at = b->addr + r->indirect, to = 0;
+        VkMemSpan sp;
+        if (!upd_read(ex, at, &to, 8) && vk_mem_resolve(at, 8, &sp))
+            memcpy(&to, (const void *)(uintptr_t)at, 8);
+        if (!to) {
+            warn_once(W_SSBO_SLOT, "a storage buffer pointer at %#llx (c%d+%#x, stage %d) is not readable: a zero buffer is bound",
+                      (unsigned long long)at, r->cbuf_slot, r->handle * 4, st);
+            return zero_info(max);
+        }
+        up.addr = to;
+        b = &up;
+    }
     if (b) {
         // vk_caps.c: shaders translated for sbuf_align address the buffer from its address rounded down to it.
         uint64_t lead = vk_caps.sbuf_align ? b->addr & (vk_caps.sbuf_align - 1) : 0;
