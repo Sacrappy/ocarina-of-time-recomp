@@ -338,6 +338,18 @@ static void sem_log(const char *op, Cpu *c, uint64_t addr, uint64_t v) {
     char d[160];
     rt_logf("sem: %s %#llx %#llx by %#x after a %.1f ms gap, at %s\n", op, (unsigned long long)addr,
             (unsigned long long)v, tcur ? tcur->handle : 0, gap / 1e6, ldr_describe(c->x[30], d, sizeof d));
+    // The queue object around the light event: the message a sender stored, and the owning thread's context.
+    {
+        uint64_t base = addr & ~7ull;
+        char line[512];
+        int o = 0;
+        for (int i = -8; i < 16 && o < (int)sizeof line - 20; i++) {
+            uint64_t ea = base + (uint64_t)(i * 8);
+            if (IsBadReadPtr((const void *)(uintptr_t)ea, 8)) continue;
+            o += snprintf(line + o, sizeof line - (size_t)o, " %+d:%#llx", i * 8, (unsigned long long)LD64(ea));
+        }
+        rt_logf("  queue words:%s\n", line);
+    }
     kern_backtrace(c);
 }
 
