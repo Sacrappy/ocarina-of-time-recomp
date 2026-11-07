@@ -186,3 +186,12 @@ B4 or a direct job file), then a mesh pipeline (D2) with the paired fragment sha
   white overexposure is still there). E1's "textured ground instead of flat black" is therefore reachable; the next
   checks are an A/B against `OOT_MESH=0` at the same world window (does the mesh geometry actually change the frame?)
   and a frame dump of the colour pass (D5).
+
+- 2026-11-08 (night, D5): a frame dump at present 1150 with `OOT_DUMP=1150` writes a 4 MB `passes.txt` that lists the
+  mesh draws with their mesh, fragment and program ids and their pass area: pass 173 (128x128, shadow/light) and pass
+  200 (1920x1080, colour), the latter for programs 6613, 6798 and 808c17bb/bd5a7c84 (task + mesh + fragment). The note
+  is written "after pass N" because the replay opens a pass at its first ordinary draw, so read it as the next pass.
+  A/B measurement caveat for the next session: `OOT_SHOTS=w...` and `--seconds` count the **display clock** (seconds
+  since the first present), not world time since the save loaded, and the game's exposure swings between frames, so
+  two runs' screenshots cannot be compared pixel by pixel until the white-flash/exposure work is done; compare the
+  dumped passes instead.
