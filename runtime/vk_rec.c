@@ -42,7 +42,7 @@ enum {
     R_SetRasterizerDiscardEnable, R_SetScissorWithCount, R_SetStencilCompareMask, R_SetStencilOp, R_SetStencilReference,
     R_SetStencilTestEnable, R_SetStencilWriteMask, R_SetViewportWithCount, R_WriteTimestamp, R_WriteTimestamp2,
     R_PushTpl, R_Push, R_VertexInput, R_Bool, R_PolygonMode, R_BlendEnable, R_BlendEquation, R_WriteMask, R_EndCb,
-    R_XfbBind, R_XfbBegin, R_XfbEnd,
+    R_XfbBind, R_XfbBegin, R_XfbEnd, R_DrawMeshTasks, R_DrawMeshTasksIndirect,
 };
 
 static uint64_t now_ns(void) {
@@ -574,6 +574,24 @@ void rec_xfb_end(PFN_vkCmdEndTransformFeedbackEXT fn, VkCommandBuffer cb) {
     pub();
 }
 
+// Mesh task draws (vk_exec_draw.c op_draw_mesh): like the other draws, they must go through the recorder so that the
+// pass, the pipeline bind and the dynamic state that precede them are already in the command buffer.
+typedef struct { void *fn; uint32_t x, y, z; } A_DrawMeshTasks;
+typedef struct { void *fn; VkBuffer b; VkDeviceSize o; uint32_t n, s; } A_DrawMeshTasksIndirect;
+void rec_draw_mesh_tasks(PFN_vkCmdDrawMeshTasksEXT fn, VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z) {
+    if (!OWNED(cb)) { fn(cb, x, y, z); return; }
+    A_DrawMeshTasks *a = put(R_DrawMeshTasks, sizeof *a);
+    *a = (A_DrawMeshTasks){(void *)fn, x, y, z};
+    pub();
+}
+void rec_draw_mesh_tasks_indirect(PFN_vkCmdDrawMeshTasksIndirectEXT fn, VkCommandBuffer cb, VkBuffer b, VkDeviceSize o,
+                                  uint32_t n, uint32_t s) {
+    if (!OWNED(cb)) { fn(cb, b, o, n, s); return; }
+    A_DrawMeshTasksIndirect *a = put(R_DrawMeshTasksIndirect, sizeof *a);
+    *a = (A_DrawMeshTasksIndirect){(void *)fn, b, o, n, s};
+    pub();
+}
+
 // ---- the recorder's side
 
 static void exec_packet(uint32_t op, void *p) {
@@ -651,6 +669,8 @@ static void exec_packet(uint32_t op, void *p) {
     case R_XfbBind: { A_XfbBind *a = p; a->fn(cb, a->first, a->n, a->b, a->o, a->sz); break; }
     case R_XfbBegin: { A_XfbCtl *a = p; ((PFN_vkCmdBeginTransformFeedbackEXT)a->fn)(cb, 0, 0, NULL, NULL); break; }
     case R_XfbEnd: { A_XfbCtl *a = p; ((PFN_vkCmdEndTransformFeedbackEXT)a->fn)(cb, 0, 0, NULL, NULL); break; }
+    case R_DrawMeshTasks: { A_DrawMeshTasks *a = p; ((PFN_vkCmdDrawMeshTasksEXT)a->fn)(cb, a->x, a->y, a->z); break; }
+    case R_DrawMeshTasksIndirect: { A_DrawMeshTasksIndirect *a = p; ((PFN_vkCmdDrawMeshTasksIndirectEXT)a->fn)(cb, a->b, a->o, a->n, a->s); break; }
     case R_EndCb: {
         A_EndCb *a = p;
         if (a->kind) vk_crumb(cb, a->kind, a->n);

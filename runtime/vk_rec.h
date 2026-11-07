@@ -46,6 +46,10 @@ void rec_xfb_bind(PFN_vkCmdBindTransformFeedbackBuffersEXT fn, VkCommandBuffer c
                   const VkDeviceSize *o, const VkDeviceSize *sz);
 void rec_xfb_begin(PFN_vkCmdBeginTransformFeedbackEXT fn, VkCommandBuffer cb);
 void rec_xfb_end(PFN_vkCmdEndTransformFeedbackEXT fn, VkCommandBuffer cb);
+// Mesh task draws.
+void rec_draw_mesh_tasks(PFN_vkCmdDrawMeshTasksEXT fn, VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z);
+void rec_draw_mesh_tasks_indirect(PFN_vkCmdDrawMeshTasksIndirectEXT fn, VkCommandBuffer cb, VkBuffer b, VkDeviceSize o,
+                                  uint32_t n, uint32_t s);
 
 #define REC_CMDS(X)                                                                                                       \
     X(BeginQuery, (VkCommandBuffer cb, VkQueryPool p, uint32_t q, VkQueryControlFlags f), (cb, p, q, f))                  \

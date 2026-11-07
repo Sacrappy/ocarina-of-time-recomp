@@ -90,6 +90,8 @@ static struct {
     VkShaderStageFlags sg32_stages;    // stages that accept requiredSubgroupSize = 32 (0: not available)
     VkDynamicState dyn[32];
     uint32_t n_dyn;
+    VkDynamicState dyn_mesh[32];             // without the states a mesh pipeline must not list
+    uint32_t n_dyn_mesh;
     PFN_vkCmdPushDescriptorSetKHR push;
     int tpl;                           // descriptor update templates on (make_tpl)
     PFN_vkCreateDescriptorUpdateTemplate tpl_create;
@@ -355,6 +357,13 @@ static int ensure_init(void) {
     if (P.dyn_blend_eq) P.dyn[P.n_dyn++] = VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT;
     if (P.dyn_wmask) P.dyn[P.n_dyn++] = VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT;
     if (P.dyn_a2c) P.dyn[P.n_dyn++] = VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT;
+    // A mesh pipeline must not list the vertex input, topology or primitive restart states (they do not exist for a
+    // mesh shader; VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07045 and its neighbours).
+    P.n_dyn_mesh = 0;
+    for (uint32_t i = 0; i < P.n_dyn; i++)
+        if (P.dyn[i] != VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY && P.dyn[i] != VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE &&
+            P.dyn[i] != VK_DYNAMIC_STATE_VERTEX_INPUT_EXT && P.dyn[i] != VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE)
+            P.dyn_mesh[P.n_dyn_mesh++] = P.dyn[i];
     pool_layout_init(c);
     cache_load(c);
     rt_log("vk_pipeline: max push descriptors %u; dynamic vertex input %d, depth clamp %d, polygon mode %d, blend enable %d, "
@@ -1144,6 +1153,7 @@ static VkShaderModule make_module(const uint32_t *w, uint64_t words) {
     VkShaderModule m = VK_NULL_HANDLE;
     VkResult r = vkCreateShaderModule(P.device, &ci, NULL, &m);
     free(fixed);
+    if (r != VK_SUCCESS) rt_log("vk_pipeline: vkCreateShaderModule failed (%d) over %llu words", (int)r, (unsigned long long)words);
     return r == VK_SUCCESS ? m : VK_NULL_HANDLE;
 }
 
@@ -1661,9 +1671,8 @@ static VkPipeline create_mesh_graphics(const VkPipeState *s, const GKey *k, cons
     const uint32_t *mcode = gfx_shader_spirv(s->mesh, &mw);
 
     if (off_ms) {
-        uint64_t n2 = 0;
-        mpatched = spirv_rebind(mcode, mw, off_ms);
-        if (mpatched) mcode = mpatched, mw = n2;
+        mpatched = spirv_rebind(mcode, mw, off_ms);   // same length: only the Binding decorations change
+        if (mpatched) mcode = mpatched;
         else LOG_ONCE("vk_pipeline: cannot move the mesh stage's bindings by %u", off_ms);
     }
     mm = make_module(mcode, mw);
@@ -1689,7 +1698,10 @@ static VkPipeline create_mesh_graphics(const VkPipeState *s, const GKey *k, cons
         if (fcode) fm = make_module(fcode, fw);
     }
     VkPipeline pipe = VK_NULL_HANDLE;
-    if (!mm || (s->ts && !tm) || (s->fs && !fm)) goto out;
+    if (!mm || (s->ts && !tm) || (s->fs && !fm)) {
+        rt_log("vk_pipeline: task/mesh module missing (mesh %d, task %d, fragment %d)", !!mm, !!tm, !!fm);
+        goto out;
+    }
 
     VkPipelineShaderStageCreateInfo stages[3];
     uint32_t nstage = 0;
@@ -1734,7 +1746,7 @@ static VkPipeline create_mesh_graphics(const VkPipeState *s, const GKey *k, cons
                                               .logicOp = k->logic_op ? (VkLogicOp)(k->logic_op - 1) : VK_LOGIC_OP_COPY,
                                               .attachmentCount = k->n_color, .pAttachments = cba};
     VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-                                           .dynamicStateCount = P.n_dyn, .pDynamicStates = P.dyn};
+                                           .dynamicStateCount = P.n_dyn_mesh, .pDynamicStates = P.dyn_mesh};
     VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = k->n_color,
                                         .pColorAttachmentFormats = (const VkFormat *)k->color,
                                         .depthAttachmentFormat = (VkFormat)k->depth, .stencilAttachmentFormat = (VkFormat)k->stencil};
@@ -3505,7 +3517,7 @@ void vk_pipeline_set_dynamic(VkCommandBuffer cb, const VkPipeState *s) {
     int front_cw = ((pl->front == NVN_FRONT_FACE_CW) != nvn_origin_lower_left()) != flip;
     vkCmdSetCullMode(cb, (VkCullModeFlags)(pl->cull & 3));   // NVN_FACE_* has VkCullModeFlagBits' values
     vkCmdSetFrontFace(cb, front_cw ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
-    vkCmdSetPrimitiveTopology(cb, vk_pipeline_topology(s->prim));
+    if (!s->mesh) vkCmdSetPrimitiveTopology(cb, vk_pipeline_topology(s->prim));
     vkCmdSetDepthTestEnable(cb, d->dt);
     vkCmdSetDepthWriteEnable(cb, d->dw);
     vkCmdSetDepthCompareOp(cb, compare_op(d->df));
@@ -3518,7 +3530,7 @@ void vk_pipeline_set_dynamic(VkCommandBuffer cb, const VkPipeState *s) {
     unsigned mode = pl->mode <= NVN_POLYGON_MODE_FILL ? pl->mode : NVN_POLYGON_MODE_FILL;
     vkCmdSetDepthBiasEnable(cb, (pl->offset_en >> mode & 1) != 0);
     vkCmdSetRasterizerDiscardEnable(cb, s->raster_discard != 0);
-    vkCmdSetPrimitiveRestartEnable(cb, s->prim_restart != 0);
+    if (!s->mesh) vkCmdSetPrimitiveRestartEnable(cb, s->prim_restart != 0);
     if (P.dyn_vi && s->vs) {
         VtxInput v;
         vertex_input(s, &v);

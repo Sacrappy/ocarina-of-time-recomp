@@ -3201,22 +3201,32 @@ static int prepare_mesh(VkExec *ex) {
 }
 
 static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d) {
+    // OOT_MESH=0 (diagnostic): the task/mesh draws stay stubs, as before phase D, to bisect what they change.
+    static int on = -1;
+    if (on < 0) on = !(cfg_get("OOT_MESH") && *cfg_get("OOT_MESH") == '0');
+    if (!on) return;
     if (!ex->prog) return warn_once(W_PROGRAM, "a mesh draw without a bound program is skipped");
     if (!mesh_fns() || !prepare_mesh(ex)) return;
+    {
+        static volatile LONG shown;
+        if (InterlockedIncrement(&shown) <= 3)
+            rt_log("vk_exec: mesh draw %s (program %llu) replayed", d->ind ? "indirect" : "direct",
+                   (unsigned long long)ex->prog->serial);
+    }
     if (d->ind) {
         VkMemSpan ip;
         if (!vk_mem_resolve(d->ind, 16, &ip) || ip.offset % 4)
             return warn_once(W_INDIRECT, "mesh task arguments at %#llx are not backed or not aligned: skipped",
                              (unsigned long long)d->ind);
         VK_MEM_USE(ip);
-        mesh_draw_indirect_fn(ex->cb, ip.buffer, ip.offset, 1, 16);
+        rec_draw_mesh_tasks_indirect(mesh_draw_indirect_fn, ex->cb, ip.buffer, ip.offset, 1, 16);
         ex->recorded++;
     } else {
         if (d->first) {
             static int said;
             if (said++ < 4) rt_log("vk_exec: a mesh draw starts at workgroup %u; Vulkan has no first workgroup, its ids start at 0", d->first);
         }
-        mesh_draw_fn(ex->cb, d->count ? d->count : 1, 1, 1);
+        rec_draw_mesh_tasks(mesh_draw_fn, ex->cb, d->count ? d->count : 1, 1, 1);
         ex->recorded++;
     }
     vk_exec_frame.draws++;
