@@ -180,3 +180,9 @@ B4 or a direct job file), then a mesh pipeline (D2) with the paired fragment sha
   instruction pointer (unknown) at ...`) and `OOT_LOG_MS=1` timestamps every log line (the loss comes seconds after
   the draw, the driver's timeout). Both epilogue loops (primitive indices, task payload) are now unrolled; the
   maximum counts bound the step count (126 primitives / 32 = 4 steps; 12 KiB payload / 32 = 96).
+
+- 2026-11-08 (night, after the fix): the level route with mesh draws enabled **completes** (1269 presents, no device
+  fault) and the shot set shows the Kokiri Forest with Link on the path, trees, grass, HUD and minimap (the known
+  white overexposure is still there). E1's "textured ground instead of flat black" is therefore reachable; the next
+  checks are an A/B against `OOT_MESH=0` at the same world window (does the mesh geometry actually change the frame?)
+  and a frame dump of the colour pass (D5).
